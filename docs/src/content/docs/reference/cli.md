@@ -121,6 +121,7 @@ no-mistakes axi run --intent "the user's goal"
 no-mistakes axi run --intent "the user's goal" --skip test,lint
 no-mistakes axi run --intent "the user's goal" --yes
 no-mistakes axi run --intent "the user's goal" --base-branch epic/foo
+no-mistakes axi run --intent "the user's goal" --pr https://github.com/owner/repo/pull/37
 ```
 
 | Flag            | Type     | Default | Description                                                                                          |
@@ -129,6 +130,7 @@ no-mistakes axi run --intent "the user's goal" --base-branch epic/foo
 | `-y`, `--yes`   | `bool`   | `false` | Auto-resolve eligible gates until a decision point or outcome                                       |
 | `--skip`        | `string` | (none)  | Comma-separated pipeline steps to skip                                                               |
 | `--base-branch` | `string` | (none)  | Integration branch for this run only; overrides [`pr.base_branch`](/no-mistakes/reference/repo-config/#prbase_branch) |
+| `--pr` | `string` | (none) | Canonical URL of one already-open GitHub PR to update; disables PR discovery and creation for this run |
 | `--wait`        | `duration` | `8m`    | Maximum time for active-run lookup and run driving before the caller must reattach |
 | `--launch-nonce` | `string` | (none) | Non-secret correlation identifier for a durable pre-drive receipt; requires `--validation-generation` |
 | `--validation-generation` | `string` | (none) | Caller-selected validation generation bound to `--launch-nonce`; requires that flag |
@@ -140,6 +142,7 @@ When starting a new run, `axi run` refuses the default branch and uncommitted wo
 Ordinary reattachment to an in-flight run does not require `--intent`; [strict launch receipts](#strict-launch-receipts) require the original intent bytes on every retry.
 `--base-branch` is persisted on the run so rebase, PR, and CI honor it after resume.
 Reattaching with a `--base-branch` that differs from the active run's stored target is refused rather than silently discarded; omit the flag to reattach, or abort the active run first.
+`--pr` is an explicit, GitHub-only binding for a PR that already exists. It accepts only a canonical `https://github.com/<owner>/<repo>/pull/<number>` URL and does not infer a PR from the branch name. Before the pipeline updates its body or pushes, it re-resolves the target and requires an open PR whose repository and base branch match this run, whose head branch is the run branch, and whose head repository equals the configured push remote. Missing, ambiguous, closed, foreign, or divergent targets fail closed before mutation. Without `--pr`, existing PR discovery and creation keep their historical behavior.
 Ordinary reattachment accepts either the run's immutable submitted head or its current pipeline head, so pipeline-created fix commits do not detach an unchanged submitting worktree.
 When neither identity matches, `axi run` keeps the fresh-run path but refuses a gate push while `branch_sync` says the pipeline still owns the branch.
 That refusal returns the complete structured state and its `continue_active_run` or `recover_custody` next action instead of a raw Git non-fast-forward.

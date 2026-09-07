@@ -82,11 +82,15 @@ type Run struct {
 	// It is set by the operator (axi run --base-branch) and takes precedence
 	// over pr.base_branch in repo config for this run only.
 	PRBaseBranch *string
-	CreatedAt    int64
-	UpdatedAt    int64
+	// PRTargetURL is an operator-requested pull request identity. It is kept
+	// separate from PRURL, which records a pull request observed after live
+	// provider verification.
+	PRTargetURL *string
+	CreatedAt   int64
+	UpdatedAt   int64
 }
 
-const runColumns = `id, repo_id, branch, head_sha, base_sha, worktree_dir, submitted_head_sha, no_mistakes_version, no_mistakes_build_sha, review_approved_head_sha, status, pr_url, pr_state, pr_state_observed_at, ci_ready_at, COALESCE(ci_ready_no_ci, 0), last_pushed_sha, push_target_kind, push_target_fingerprint, push_ref, last_pushed_at, push_generation, COALESCE(push_active, 0), terminal_head_verified_at, custody_returned_at, error, awaiting_agent_since, COALESCE(parked_ms, 0), intent, intent_source, intent_session_id, intent_score, launch_nonce, launch_validation_generation, launch_intent_digest, launch_receipt_claimed_at, pr_base_branch, created_at, updated_at`
+const runColumns = `id, repo_id, branch, head_sha, base_sha, worktree_dir, submitted_head_sha, no_mistakes_version, no_mistakes_build_sha, review_approved_head_sha, status, pr_url, pr_state, pr_state_observed_at, ci_ready_at, COALESCE(ci_ready_no_ci, 0), last_pushed_sha, push_target_kind, push_target_fingerprint, push_ref, last_pushed_at, push_generation, COALESCE(push_active, 0), terminal_head_verified_at, custody_returned_at, error, awaiting_agent_since, COALESCE(parked_ms, 0), intent, intent_source, intent_session_id, intent_score, launch_nonce, launch_validation_generation, launch_intent_digest, launch_receipt_claimed_at, pr_base_branch, pr_target_url, created_at, updated_at`
 
 func scanRun(row interface {
 	Scan(...any) error
@@ -99,7 +103,7 @@ func scanRun(row interface {
 		&r.CustodyReturnedAt, &r.Error, &r.AwaitingAgentSince, &r.ParkedMS,
 		&r.Intent, &r.IntentSource, &r.IntentSessionID, &r.IntentScore,
 		&r.LaunchNonce, &r.LaunchValidationGeneration, &r.LaunchIntentDigest, &r.LaunchReceiptClaimedAt,
-		&r.PRBaseBranch,
+		&r.PRBaseBranch, &r.PRTargetURL,
 		&r.CreatedAt, &r.UpdatedAt,
 	)
 }
@@ -127,6 +131,12 @@ func (d *DB) InsertRunWithIntent(repoID, branch, headSHA, baseSHA string, intent
 // partial unique index remains the duplicate defense across daemon processes;
 // callers additionally serialize selection under their branch lock.
 func (d *DB) InsertRunWithIntentAndLaunchNonce(repoID, branch, headSHA, baseSHA string, intent *RunIntent, launchNonce, validationGeneration, intentDigest, prBaseBranch string) (*Run, error) {
+	return d.InsertRunWithIntentAndLaunchNonceAndPRTarget(repoID, branch, headSHA, baseSHA, intent, launchNonce, validationGeneration, intentDigest, prBaseBranch, "")
+}
+
+// InsertRunWithIntentAndLaunchNonceAndPRTarget persists an optional explicit
+// requested PR identity without claiming that the provider has observed it.
+func (d *DB) InsertRunWithIntentAndLaunchNonceAndPRTarget(repoID, branch, headSHA, baseSHA string, intent *RunIntent, launchNonce, validationGeneration, intentDigest, prBaseBranch, prTargetURL string) (*Run, error) {
 	ts := now()
 	version := buildinfo.CurrentVersion()
 	buildSHA := buildinfo.Commit
@@ -158,9 +168,13 @@ func (d *DB) InsertRunWithIntentAndLaunchNonce(repoID, branch, headSHA, baseSHA 
 	if prBaseBranch != "" {
 		r.PRBaseBranch = &prBaseBranch
 	}
+	prTargetURL = strings.TrimSpace(prTargetURL)
+	if prTargetURL != "" {
+		r.PRTargetURL = &prTargetURL
+	}
 	_, err := d.sql.Exec(
-		`INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, submitted_head_sha, no_mistakes_version, no_mistakes_build_sha, status, pr_state, intent, intent_source, intent_session_id, intent_score, launch_nonce, launch_validation_generation, launch_intent_digest, pr_base_branch, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'none', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		r.ID, r.RepoID, r.Branch, r.HeadSHA, r.BaseSHA, headSHA, r.NoMistakesVersion, r.NoMistakesBuildSHA, r.Status, r.Intent, r.IntentSource, r.IntentSessionID, r.IntentScore, r.LaunchNonce, r.LaunchValidationGeneration, r.LaunchIntentDigest, r.PRBaseBranch, r.CreatedAt, r.UpdatedAt,
+		`INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, submitted_head_sha, no_mistakes_version, no_mistakes_build_sha, status, pr_state, intent, intent_source, intent_session_id, intent_score, launch_nonce, launch_validation_generation, launch_intent_digest, pr_base_branch, pr_target_url, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'none', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		r.ID, r.RepoID, r.Branch, r.HeadSHA, r.BaseSHA, headSHA, r.NoMistakesVersion, r.NoMistakesBuildSHA, r.Status, r.Intent, r.IntentSource, r.IntentSessionID, r.IntentScore, r.LaunchNonce, r.LaunchValidationGeneration, r.LaunchIntentDigest, r.PRBaseBranch, r.PRTargetURL, r.CreatedAt, r.UpdatedAt,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("insert run: %w", err)
@@ -324,7 +338,16 @@ func (d *DB) GetRunByLaunchNonce(repoID, branch, launchNonce string) (*Run, erro
 // including an explicit PR base branch, is part of the UPDATE predicate, so a
 // conflicting observer cannot consume `created`.
 func (d *DB) ClaimLaunchReceipt(repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intentDigest, prBaseBranch string) (*Run, bool, error) {
+	return d.ClaimLaunchReceiptWithPRTarget(repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intentDigest, prBaseBranch, "")
+}
+
+// ClaimLaunchReceiptWithPRTarget atomically claims a proof-mode receipt only
+// when the immutable explicit target identity still agrees. An omitted target
+// remains compatible with a historical target-bearing receipt for reattach;
+// any supplied target must match exactly.
+func (d *DB) ClaimLaunchReceiptWithPRTarget(repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intentDigest, prBaseBranch, prTargetURL string) (*Run, bool, error) {
 	prBaseBranch = strings.TrimSpace(prBaseBranch)
+	prTargetURL = strings.TrimSpace(prTargetURL)
 	for {
 		r := &Run{}
 		err := scanRun(d.sql.QueryRow(
@@ -332,9 +355,10 @@ func (d *DB) ClaimLaunchReceipt(repoID, branch, launchNonce, submittedHeadSHA, v
 			 WHERE repo_id = ? AND branch = ? AND launch_nonce = ?
 			   AND submitted_head_sha = ? AND launch_validation_generation = ? AND launch_intent_digest = ?
 			   AND (? = '' OR pr_base_branch = ?)
+			   AND (? = '' OR pr_target_url = ?)
 			   AND launch_receipt_claimed_at IS NULL
 			 RETURNING `+runColumns,
-			now(), repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intentDigest, prBaseBranch, prBaseBranch,
+			now(), repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intentDigest, prBaseBranch, prBaseBranch, prTargetURL, prTargetURL,
 		), r)
 		if err == nil {
 			return r, true, nil
@@ -351,6 +375,9 @@ func (d *DB) ClaimLaunchReceipt(repoID, branch, launchNonce, submittedHeadSHA, v
 			r.LaunchValidationGeneration == nil || *r.LaunchValidationGeneration != validationGeneration ||
 			r.LaunchIntentDigest == nil || *r.LaunchIntentDigest != intentDigest ||
 			prBaseBranch != "" && (r.PRBaseBranch == nil || *r.PRBaseBranch != prBaseBranch) {
+			return r, false, nil
+		}
+		if prTargetURL != "" && (r.PRTargetURL == nil || *r.PRTargetURL != prTargetURL) {
 			return r, false, nil
 		}
 		// A creator committed a matching row after UPDATE missed. Retry instead

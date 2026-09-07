@@ -533,13 +533,19 @@ func attestHeadBeforePush(sctx *pipeline.StepContext, headSHA string, steps []*d
 		}
 		return nil
 	}
-	discovered, err := host.FindPR(sctx.Ctx, branch, "")
+	pr, targetBound, err := resolveExplicitPRTarget(sctx, host)
 	if err != nil {
-		return fmt.Errorf("%w: find pull request: %v", errAttestationWriteFailed, err)
+		return fmt.Errorf("%w: resolve explicit pull request target: %v", errAttestationWriteFailed, err)
 	}
-	pr, err := bindExistingPR(sctx, host, discovered)
-	if err != nil {
-		return fmt.Errorf("%w: resolve pull request: %v", errAttestationWriteFailed, err)
+	if !targetBound {
+		discovered, err := host.FindPR(sctx.Ctx, branch, "")
+		if err != nil {
+			return fmt.Errorf("%w: find pull request: %v", errAttestationWriteFailed, err)
+		}
+		pr, err = bindExistingPR(sctx, host, discovered)
+		if err != nil {
+			return fmt.Errorf("%w: resolve pull request: %v", errAttestationWriteFailed, err)
+		}
 	}
 	if pr == nil {
 		return nil

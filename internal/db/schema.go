@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS runs (
     launch_intent_digest TEXT,
     launch_receipt_claimed_at INTEGER,
     pr_base_branch       TEXT,
+	pr_target_url        TEXT,
     created_at           INTEGER NOT NULL,
     updated_at           INTEGER NOT NULL
 );
@@ -275,6 +276,9 @@ var migrationStatements = []string{
 	// --base-branch). Nullable: absent means fall back to repo config and the
 	// forge default branch.
 	`ALTER TABLE runs ADD COLUMN pr_base_branch TEXT`,
+	// An explicit requested PR identity is distinct from pr_url, which records
+	// a live provider-observed PR after verification.
+	`ALTER TABLE runs ADD COLUMN pr_target_url TEXT`,
 	// The start of the currently displayed execution/fix round is separate
 	// from started_at, which remains the whole-step clock.
 	`ALTER TABLE step_results ADD COLUMN round_started_at INTEGER`,

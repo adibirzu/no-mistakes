@@ -90,22 +90,35 @@ func (s *PRStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 		return nil, err
 	}
 
-	sctx.Log(fmt.Sprintf("checking for existing pull request on branch %s...", branch))
-	existing, err := host.FindPR(ctx, branch, "")
+	// An operator-selected target must never fall back to branch discovery.
+	// The legacy path remains unchanged when no explicit target was requested.
+	existing, targetBound, err := resolveExplicitPRTarget(sctx, host)
 	if err != nil {
 		return nil, err
 	}
-	existing, err = bindExistingPR(sctx, host, existing)
-	if err != nil {
-		return nil, err
+	if !targetBound {
+		sctx.Log(fmt.Sprintf("checking for existing pull request on branch %s...", branch))
+		existing, err = host.FindPR(ctx, branch, "")
+		if err != nil {
+			return nil, err
+		}
+		existing, err = bindExistingPR(sctx, host, existing)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if existing != nil {
 		sctx.Log(fmt.Sprintf("pull request already exists: %s, updating...", describePR(existing)))
-		if err := retargetExistingPRIfNeeded(sctx, host, existing, runPRBaseBranch(sctx)); err != nil {
-			return nil, err
+		if !targetBound {
+			if err := retargetExistingPRIfNeeded(sctx, host, existing, runPRBaseBranch(sctx)); err != nil {
+				return nil, err
+			}
 		}
 		updated, err := host.UpdatePR(ctx, existing, scm.PRContent(content))
 		if err != nil {
+			if targetBound {
+				return nil, fmt.Errorf("update explicit pull request target %s: %w", describePR(existing), err)
+			}
 			sctx.Log(fmt.Sprintf("warning: failed to update PR: %v", err))
 			updated = existing
 		}
@@ -115,7 +128,13 @@ func (s *PRStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 			}
 			return &pipeline.StepOutcome{PRURL: updated.URL}, nil
 		}
+		if targetBound {
+			return nil, fmt.Errorf("explicit pull request target %s update returned no URL", describePR(existing))
+		}
 		return &pipeline.StepOutcome{}, nil
+	}
+	if targetBound {
+		return nil, fmt.Errorf("explicit pull request target %q disappeared before update", runPRTargetURL(sctx))
 	}
 
 	sctx.Log("creating pull request...")

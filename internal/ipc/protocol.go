@@ -79,6 +79,7 @@ type PushReceivedParams struct {
 	LaunchNonce          string           `json:"launch_nonce,omitempty"`
 	ValidationGeneration string           `json:"validation_generation,omitempty"`
 	PRBaseBranch         string           `json:"pr_base_branch,omitempty"`
+	PRTargetURL          string           `json:"pr_target_url,omitempty"`
 }
 
 // StartFreshRunParams requests a nonce-bound fresh launch for one exact gate
@@ -93,6 +94,7 @@ type StartFreshRunParams struct {
 	LaunchNonce          string           `json:"launch_nonce"`
 	ValidationGeneration string           `json:"validation_generation"`
 	PRBaseBranch         string           `json:"pr_base_branch,omitempty"`
+	PRTargetURL          string           `json:"pr_target_url,omitempty"`
 }
 
 // ClaimLaunchReceiptParams identifies one exact opaque receipt binding.
@@ -105,6 +107,7 @@ type ClaimLaunchReceiptParams struct {
 	ValidationGeneration string `json:"validation_generation"`
 	IntentDigest         string `json:"intent_digest"`
 	PRBaseBranch         string `json:"pr_base_branch,omitempty"`
+	PRTargetURL          string `json:"pr_target_url,omitempty"`
 }
 
 // GetRunParams requests a single run by ID.
@@ -163,6 +166,7 @@ type RerunParams struct {
 	SkipSteps     []types.StepName `json:"skip_steps,omitempty"`
 	Intent        string           `json:"intent,omitempty"`
 	PRBaseBranch  string           `json:"pr_base_branch,omitempty"`
+	PRTargetURL   string           `json:"pr_target_url,omitempty"`
 	// CallerHeadSHA is a clean caller worktree's HEAD, when known. It guards
 	// the daemon's selected head; it never supplies a replacement run head.
 	CallerHeadSHA string `json:"caller_head_sha,omitempty"`
@@ -318,6 +322,9 @@ type RunInfo struct {
 	// PRBaseBranch is the per-run PR target override, if the operator set
 	// --base-branch when starting this run.
 	PRBaseBranch *string `json:"pr_base_branch,omitempty"`
+	// PRTargetURL is the requested operator-selected identity. It is local
+	// run state, not a provider-observed PR URL.
+	PRTargetURL *string `json:"pr_target_url,omitempty"`
 	// AwaitingAgent is true while the run is parked at a gate awaiting the
 	// driving agent's response. AwaitingAgentSince is the unix-seconds time it
 	// parked, so a supervisor can read "parked for N seconds" in one call. Both

@@ -1280,7 +1280,7 @@ func registerHandlers(srv *ipc.Server, mgr *RunManager, d *db.DB, shutdown func(
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, fmt.Errorf("invalid params: %w", err)
 		}
-		runID, err := mgr.HandleRerun(ctx, p.RepoID, p.Branch, p.PreviousRunID, p.SkipSteps, p.Intent, p.PRBaseBranch, p.CallerHeadSHA)
+		runID, err := mgr.HandleRerun(ctx, p.RepoID, p.Branch, p.PreviousRunID, p.SkipSteps, p.Intent, p.PRBaseBranch, p.PRTargetURL, p.CallerHeadSHA)
 		if err != nil {
 			return nil, err
 		}
@@ -1417,6 +1417,7 @@ func runToInfo(d *db.DB, r *db.Run, steps []*db.StepResult) *ipc.RunInfo {
 		CIReady:            r.CIReadyAt != nil,
 		CIReadyNoCI:        r.CIReadyNoCI,
 		PRBaseBranch:       r.PRBaseBranch,
+		PRTargetURL:        r.PRTargetURL,
 		AwaitingAgent:      r.AwaitingAgentSince != nil,
 		AwaitingAgentSince: r.AwaitingAgentSince,
 		CreatedAt:          r.CreatedAt,

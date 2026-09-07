@@ -121,6 +121,10 @@ func newDaemonNotifyPushCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			prTargetURL, err := parsePRTargetPushOptions(pushOptions)
+			if err != nil {
+				return err
+			}
 			gatePath, err := normalizeNotifyGatePath(gate)
 			if err != nil {
 				return err
@@ -148,6 +152,7 @@ func newDaemonNotifyPushCmd() *cobra.Command {
 				LaunchNonce:          launchNonce,
 				ValidationGeneration: validationGeneration,
 				PRBaseBranch:         prBaseBranch,
+				PRTargetURL:          prTargetURL,
 			}, &result)
 		},
 	}
@@ -264,6 +269,7 @@ func parseOpaquePushOptions(options []string, prefix, label string) (string, err
 
 // prBaseBranchPushOptionPrefix carries a per-run PR base branch through a git push.
 const prBaseBranchPushOptionPrefix = "no-mistakes.pr-base-branch="
+const prTargetPushOptionPrefix = "no-mistakes.pr-url="
 
 // formatIntentPushOption encodes intent as a single push option, or returns ""
 // when there is no intent to carry.
@@ -317,6 +323,42 @@ func parsePRBaseBranchPushOptions(options []string) (string, error) {
 		branch = value
 	}
 	return branch, nil
+}
+
+// formatPRTargetPushOption carries a canonical explicit PR identity through
+// the gate push without exposing spaces or shell-sensitive URL characters.
+func formatPRTargetPushOption(targetURL string) string {
+	targetURL = strings.TrimSpace(targetURL)
+	if targetURL == "" {
+		return ""
+	}
+	return prTargetPushOptionPrefix + base64.StdEncoding.EncodeToString([]byte(targetURL))
+}
+
+// parsePRTargetPushOptions accepts exact duplicate identity options but
+// rejects conflicting values. Unlike base branch selection, choosing a last
+// value here would silently choose which manually opened PR receives writes.
+func parsePRTargetPushOptions(options []string) (string, error) {
+	value := ""
+	for _, option := range options {
+		encoded, ok := strings.CutPrefix(option, prTargetPushOptionPrefix)
+		if !ok {
+			continue
+		}
+		decodedBytes, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			return "", fmt.Errorf("decode pr target push option: %w", err)
+		}
+		decoded := string(decodedBytes)
+		if strings.TrimSpace(decoded) == "" {
+			return "", fmt.Errorf("pr target push option must not be empty")
+		}
+		if value != "" && value != decoded {
+			return "", fmt.Errorf("conflicting pr target push options")
+		}
+		value = decoded
+	}
+	return value, nil
 }
 
 func formatSkipPushOptions(steps []types.StepName) []string {
