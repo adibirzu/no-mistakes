@@ -450,6 +450,14 @@ func fakeCIGHReconcileHandler(args []string) {
 }
 
 func fakeGHHandlePRContentCommands(args []string, joined string) {
+	if strings.Contains(joined, "pr view") && strings.Contains(joined, "--json number,url,state,baseRefName,headRefName,baseRepository,headRepository") {
+		if target := os.Getenv("FAKE_CLI_PR_TARGET_JSON"); target != "" {
+			fmt.Println(target)
+			os.Exit(0)
+		}
+		fmt.Fprintln(os.Stderr, "missing FAKE_CLI_PR_TARGET_JSON")
+		os.Exit(1)
+	}
 	if strings.Contains(joined, "pr view") && strings.Contains(joined, "--json title,body") {
 		title := os.Getenv("FAKE_CLI_PR_TITLE")
 		if title == "" {

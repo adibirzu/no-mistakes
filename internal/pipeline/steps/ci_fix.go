@@ -507,10 +507,13 @@ func (s *CIStep) publishRepair(sctx *pipeline.StepContext, headSHA string) (ciRe
 // the branch is the configured PR base branch (the PR step never manages a
 // PR there either, see effectivePRBaseBranch); the SCM host is unavailable
 // (matches the PR step's own skip semantics); or no PR exists yet for this
-// branch. It never mints an attestation for a PR that was not raised through
-// no-mistakes - restampPRAttestationWithSteps already enforces that. Any
-// other failure (PR discovery errors, or a discoverable PR whose write does
-// not settle) is wrapped in errAttestationWriteFailed and returned.
+// branch. It never mints an attestation for a PR found by branch discovery -
+// restampPRAttestationWithSteps already enforces that. The sole exception is
+// a live-verified explicit --pr target: the operator selected that exact
+// manually opened PR, so bootstrapPRAttestationWithSteps may append the
+// complete pipeline section before its first push. Any other failure (PR
+// discovery errors, or a discoverable PR whose write does not settle) is
+// wrapped in errAttestationWriteFailed and returned.
 func attestHeadBeforePush(sctx *pipeline.StepContext, headSHA string, steps []*db.StepResult) error {
 	provider := resolvedProvider(sctx)
 	if provider != scm.ProviderGitHub {
@@ -550,8 +553,19 @@ func attestHeadBeforePush(sctx *pipeline.StepContext, headSHA string, steps []*d
 	if pr == nil {
 		return nil
 	}
-	if err := restampPRAttestationWithSteps(sctx.Ctx, host, pr, headSHA, steps, sctx.Log); err != nil {
-		return fmt.Errorf("%w: %v", errAttestationWriteFailed, err)
+	var attestErr error
+	if targetBound {
+		// An explicit target is the operator's narrowly scoped authority to
+		// adopt this one manually opened PR. Bootstrap its required marker
+		// before the first push, while retaining the body and its concurrent
+		// edit protection. The unbound path must never adopt a branch-matched
+		// PR this way.
+		attestErr = bootstrapPRAttestationWithSteps(sctx.Ctx, host, pr, headSHA, steps, sctx.Log)
+	} else {
+		attestErr = restampPRAttestationWithSteps(sctx.Ctx, host, pr, headSHA, steps, sctx.Log)
+	}
+	if attestErr != nil {
+		return fmt.Errorf("%w: %v", errAttestationWriteFailed, attestErr)
 	}
 	return nil
 }
@@ -572,8 +586,28 @@ func restampPRAttestation(ctx context.Context, host scm.Host, pr *scm.PR, newHea
 // replaces them outright. See attestHeadBeforePush for why a caller picks
 // one over the other.
 func restampPRAttestationWithSteps(ctx context.Context, host scm.Host, pr *scm.PR, newHeadSHA string, steps []*db.StepResult, logfn func(string)) error {
+	return writePRAttestationWithSteps(ctx, host, pr, newHeadSHA, steps, false, logfn)
+}
+
+// bootstrapPRAttestationWithSteps establishes a marker only for a PR the
+// operator explicitly selected and already live-verified. It is deliberately
+// not used by branch discovery: a branch match alone never authorizes the
+// pipeline to adopt a manually opened PR.
+func bootstrapPRAttestationWithSteps(ctx context.Context, host scm.Host, pr *scm.PR, newHeadSHA string, steps []*db.StepResult, logfn func(string)) error {
+	return writePRAttestationWithSteps(ctx, host, pr, newHeadSHA, steps, true, logfn)
+}
+
+// writePRAttestationWithSteps preserves the existing read-compare-write
+// settlement protocol for both rebinding and the explicit-target bootstrap.
+// Bootstrap is a strict opt-in: it appends a complete pipeline section only
+// when the body contains no attestation marker at all; a malformed marker is
+// left untouched and fails closed rather than being shadowed by a new one.
+func writePRAttestationWithSteps(ctx context.Context, host scm.Host, pr *scm.PR, newHeadSHA string, steps []*db.StepResult, bootstrap bool, logfn func(string)) error {
 	reader, ok := host.(scm.PRContentReader)
 	if !ok || pr == nil {
+		if bootstrap {
+			return errors.New("cannot bootstrap pipeline attestation: SCM host cannot read PR content")
+		}
 		if logfn != nil && !ok {
 			logfn("skipping attestation rebind: SCM host cannot read PR content")
 		}
@@ -585,8 +619,19 @@ func restampPRAttestationWithSteps(ctx context.Context, host scm.Host, pr *scm.P
 		content, err := reader.GetPRContent(ctx, pr)
 		if err == nil {
 			updated, rebound := rebindPipelineAttestationWithSteps(content.Body, newHeadSHA, steps)
+			bootstrapped := false
+			if !rebound && bootstrap {
+				updated, err = bootstrapPipelineAttestationWithSteps(content.Body, newHeadSHA, steps)
+				bootstrapped = err == nil
+			}
+			if err != nil {
+				lastErr = err
+				continue
+			}
 			if !rebound || updated == content.Body {
-				return nil
+				if !bootstrapped {
+					return nil
+				}
 			}
 
 			// UpdatePR replaces the complete body and GitHub offers no atomic
@@ -607,7 +652,11 @@ func restampPRAttestationWithSteps(ctx context.Context, host scm.Host, pr *scm.P
 		}
 		if err == nil {
 			if logfn != nil {
-				logfn(fmt.Sprintf("rebound pipeline attestation to %s", shortObjectID(newHeadSHA)))
+				verb := "rebound"
+				if bootstrap {
+					verb = "established"
+				}
+				logfn(fmt.Sprintf("%s pipeline attestation to %s", verb, shortObjectID(newHeadSHA)))
 			}
 			return nil
 		}
@@ -620,4 +669,24 @@ func restampPRAttestationWithSteps(ctx context.Context, host scm.Host, pr *scm.P
 		}
 	}
 	return fmt.Errorf("attestation rebind failed after %d attempts: %w", attempts, lastErr)
+}
+
+func bootstrapPipelineAttestationWithSteps(body, newHeadSHA string, steps []*db.StepResult) (string, error) {
+	if strings.TrimSpace(newHeadSHA) == "" {
+		return "", errors.New("cannot bootstrap pipeline attestation without a head SHA")
+	}
+	if strings.Contains(body, pipelineAttestationCommentPrefix) {
+		return "", errors.New("cannot bootstrap pipeline attestation over a malformed existing marker")
+	}
+	if len(steps) == 0 {
+		return "", errors.New("cannot bootstrap pipeline attestation without current pipeline step results")
+	}
+	summary, _ := BuildPipelineSummary(steps, nil, newHeadSHA)
+	if strings.TrimSpace(summary) == "" {
+		return "", errors.New("cannot bootstrap pipeline attestation from current pipeline step results")
+	}
+	if strings.TrimSpace(body) == "" {
+		return summary, nil
+	}
+	return strings.TrimRight(body, "\n") + "\n\n" + summary, nil
 }
