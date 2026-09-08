@@ -1055,7 +1055,11 @@ func (m *RunManager) HandleRerun(ctx context.Context, repoID, branch, previousRu
 	if storedPRBaseBranch == "" && selectedRun.PRBaseBranch != nil {
 		storedPRBaseBranch = strings.TrimSpace(*selectedRun.PRBaseBranch)
 	}
-	return m.startRunWithIntentSource(ctx, repo, branch, headSHA, baseSHA, "rerun", skipSteps, intent, intentSource, storedPRBaseBranch, prTargetURL, inheritablePRURL(selectedRun))
+	storedPRTargetURL := strings.TrimSpace(prTargetURL)
+	if storedPRTargetURL == "" && selectedRun.PRTargetURL != nil {
+		storedPRTargetURL = strings.TrimSpace(*selectedRun.PRTargetURL)
+	}
+	return m.startRunWithIntentSource(ctx, repo, branch, headSHA, baseSHA, "rerun", skipSteps, intent, intentSource, storedPRBaseBranch, storedPRTargetURL, inheritablePRURL(selectedRun))
 }
 
 func inheritablePRURL(run *db.Run) string {

@@ -1236,7 +1236,11 @@ func registerHandlers(srv *ipc.Server, mgr *RunManager, d *db.DB, shutdown func(
 		if err != nil {
 			return nil, err
 		}
-		run, claimed, err := d.ClaimLaunchReceipt(p.RepoID, p.Branch, p.LaunchNonce, p.SubmittedHeadSHA, p.ValidationGeneration, p.IntentDigest, prBaseBranch)
+		prTargetURL, err := normalizeRunPRTargetURL(p.PRTargetURL)
+		if err != nil {
+			return nil, err
+		}
+		run, claimed, err := d.ClaimLaunchReceiptWithPRTarget(p.RepoID, p.Branch, p.LaunchNonce, p.SubmittedHeadSHA, p.ValidationGeneration, p.IntentDigest, prBaseBranch, prTargetURL)
 		if err != nil {
 			return nil, fmt.Errorf("claim launch receipt: %w", err)
 		}
@@ -1245,6 +1249,9 @@ func registerHandlers(srv *ipc.Server, mgr *RunManager, d *db.DB, shutdown func(
 		}
 		if !launchPRBaseBranchMatches(run, prBaseBranch) {
 			return nil, conflictingLaunchPRBaseBranch(p.LaunchNonce)
+		}
+		if !launchPRTargetMatches(run, prTargetURL) {
+			return nil, conflictingLaunchPRTarget(p.LaunchNonce)
 		}
 
 		receipt, err := receiptForRun(run, claimed)
