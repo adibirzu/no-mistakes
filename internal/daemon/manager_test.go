@@ -242,6 +242,14 @@ func TestProofLaunchReceiptPushCrashWindowConcurrentClaimsAndImmutableReplay(t *
 	if err == nil || !strings.Contains(err.Error(), "different pr target") {
 		t.Fatalf("mismatched target claim err = %v, want target mismatch", err)
 	}
+	err = client.Call(ipc.MethodClaimLaunchReceipt, &ipc.ClaimLaunchReceiptParams{
+		RepoID: repo.ID, Branch: "main", LaunchNonce: "push-nonce",
+		SubmittedHeadSHA: headSHA, ValidationGeneration: generation, IntentDigest: digestIntent(intent),
+		PRBaseBranch: "review/base",
+	}, &mismatched)
+	if err == nil || !strings.Contains(err.Error(), "different pr target") {
+		t.Fatalf("omitted target claim err = %v, want target mismatch", err)
+	}
 	logLaunchEvidence(t, "base-conflict", err.Error())
 	stored, err := d.GetRun(pushed.RunID)
 	if err != nil || stored == nil || stored.LaunchReceiptClaimedAt != nil {

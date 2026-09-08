@@ -907,10 +907,14 @@ func conflictingLaunchPRBaseBranch(launchNonce string) error {
 }
 
 func launchPRTargetMatches(run *db.Run, requested string) bool {
-	if requested == "" {
-		return true
+	if run == nil {
+		return false
 	}
-	return run != nil && run.PRTargetURL != nil && strings.TrimSpace(*run.PRTargetURL) == requested
+	stored := ""
+	if run.PRTargetURL != nil {
+		stored = strings.TrimSpace(*run.PRTargetURL)
+	}
+	return stored == requested
 }
 
 func conflictingLaunchPRTarget(launchNonce string) error {

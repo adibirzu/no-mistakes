@@ -341,10 +341,6 @@ func (d *DB) ClaimLaunchReceipt(repoID, branch, launchNonce, submittedHeadSHA, v
 	return d.ClaimLaunchReceiptWithPRTarget(repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intentDigest, prBaseBranch, "")
 }
 
-// ClaimLaunchReceiptWithPRTarget atomically claims a proof-mode receipt only
-// when the immutable explicit target identity still agrees. An omitted target
-// remains compatible with a historical target-bearing receipt for reattach;
-// any supplied target must match exactly.
 func (d *DB) ClaimLaunchReceiptWithPRTarget(repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intentDigest, prBaseBranch, prTargetURL string) (*Run, bool, error) {
 	prBaseBranch = strings.TrimSpace(prBaseBranch)
 	prTargetURL = strings.TrimSpace(prTargetURL)
@@ -355,7 +351,7 @@ func (d *DB) ClaimLaunchReceiptWithPRTarget(repoID, branch, launchNonce, submitt
 			 WHERE repo_id = ? AND branch = ? AND launch_nonce = ?
 			   AND submitted_head_sha = ? AND launch_validation_generation = ? AND launch_intent_digest = ?
 			   AND (? = '' OR pr_base_branch = ?)
-			   AND (? = '' OR pr_target_url = ?)
+			   AND (pr_target_url = ? OR (pr_target_url IS NULL AND ? = ''))
 			   AND launch_receipt_claimed_at IS NULL
 			 RETURNING `+runColumns,
 			now(), repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intentDigest, prBaseBranch, prBaseBranch, prTargetURL, prTargetURL,
@@ -377,7 +373,11 @@ func (d *DB) ClaimLaunchReceiptWithPRTarget(repoID, branch, launchNonce, submitt
 			prBaseBranch != "" && (r.PRBaseBranch == nil || *r.PRBaseBranch != prBaseBranch) {
 			return r, false, nil
 		}
-		if prTargetURL != "" && (r.PRTargetURL == nil || *r.PRTargetURL != prTargetURL) {
+		storedPRTargetURL := ""
+		if r.PRTargetURL != nil {
+			storedPRTargetURL = *r.PRTargetURL
+		}
+		if storedPRTargetURL != prTargetURL {
 			return r, false, nil
 		}
 		// A creator committed a matching row after UPDATE missed. Retry instead
