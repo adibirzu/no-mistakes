@@ -1,9 +1,11 @@
 package steps
 
 import (
+	"os"
 	"strings"
 	"testing"
 
+	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/scm"
 )
 
@@ -97,6 +99,42 @@ func TestVerifyExplicitPRTarget(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPRStep_ExplicitTargetNeverDiscoversOrCreatesReplacement(t *testing.T) {
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	const targetURL = "https://github.com/test/repo/pull/42"
+
+	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, baseSHA, headSHA, config.Commands{})
+	sctx.Repo.UpstreamURL = "https://github.com/test/repo"
+	sctx.Repo.ForkURL = "https://github.com/test/repo"
+	sctx.Run.Branch = "refs/heads/feature"
+	sctx.Run.PRTargetURL = strptr(targetURL)
+	logFile := t.TempDir() + "/gh.log"
+	targetJSON := `{"number":42,"url":"https://github.com/test/repo/pull/42","state":"OPEN","baseRefName":"main","headRefName":"feature","baseRepository":{"url":"https://github.com/test/repo"},"headRepository":{"url":"https://github.com/test/repo"}}`
+	sctx.Env = append(fakeCIGH(t, "OPEN", `[]`),
+		"FAKE_CLI_LOG="+logFile,
+		"FAKE_CLI_PR_TARGET_JSON="+targetJSON,
+	)
+
+	if _, err := (&PRStep{}).Execute(sctx); err != nil {
+		t.Fatal(err)
+	}
+	logData, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transcript := string(logData)
+	if !strings.Contains(transcript, "pr view "+targetURL+" --json number,url,state,baseRefName,headRefName,baseRepository,headRepository") {
+		t.Fatalf("expected live lookup of selected pull request, got:\n%s", transcript)
+	}
+	if !strings.Contains(transcript, "pr edit 42") {
+		t.Fatalf("expected only the selected pull request to be updated, got:\n%s", transcript)
+	}
+	if strings.Contains(transcript, "pr list") || strings.Contains(transcript, "pr create") {
+		t.Fatalf("explicit target must not use discovery or create a replacement PR, got:\n%s", transcript)
+	}
+	t.Logf("explicit PR transcript:\n%s", transcript)
 }
 
 func clonePRTarget(source *scm.PRTarget, mutate func(*scm.PRTarget)) *scm.PRTarget {
