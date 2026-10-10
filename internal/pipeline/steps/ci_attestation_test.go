@@ -892,6 +892,80 @@ func TestPushStep_DoesNotMintAttestation(t *testing.T) {
 	}
 }
 
+// TestPushStep_BoundManualPRBootstrapsAttestationBeforePush covers the narrow
+// exception to TestPushStep_DoesNotMintAttestation: an operator explicitly
+// bound this run to one live-verified manual PR, so its existing body is safe
+// to retain while the pipeline appends its required marker before the push.
+func TestPushStep_BoundManualPRBootstrapsAttestationBeforePush(t *testing.T) {
+	upstream := t.TempDir()
+	gitCmd(t, upstream, "init", "--bare")
+
+	dir, baseSHA, _ := setupGitRepo(t)
+	gitCmd(t, dir, "remote", "add", "origin", upstream)
+	gitCmd(t, dir, "push", "origin", "main")
+	gitCmd(t, dir, "push", "origin", "feature")
+
+	if err := os.WriteFile(filepath.Join(dir, "new-work.txt"), []byte("new work\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, dir, "add", "-A")
+	gitCmd(t, dir, "commit", "-m", "new work")
+	newHead := gitCmd(t, dir, "rev-parse", "HEAD")
+
+	const (
+		manualBody = "A manually opened PR whose discussion must remain intact."
+		prURL      = "https://github.com/test/repo/pull/42"
+	)
+	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, baseSHA, newHead, config.Commands{})
+	sctx.Repo.UpstreamURL = "https://github.com/test/repo"
+	sctx.Repo.URLsVerified = true
+	gitCmd(t, dir, "config", "url."+upstream+".insteadOf", sctx.Repo.UpstreamURL)
+	sctx.Run.Branch = "refs/heads/feature"
+	targetURL := prURL
+	sctx.Run.PRTargetURL = &targetURL
+	setupGateMirror(t, sctx)
+	recordReviewApproval(t, sctx, newHead)
+	for _, name := range []types.StepName{types.StepReview, types.StepTest, types.StepDocument} {
+		sr, err := sctx.DB.InsertStepResult(sctx.Run.ID, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := sctx.DB.UpdateStepStatus(sr.ID, types.StepStatusCompleted); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	bodyFile := filepath.Join(t.TempDir(), "pr-body.md")
+	if err := os.WriteFile(bodyFile, []byte(manualBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	logFile := filepath.Join(t.TempDir(), "gh.log")
+	targetJSON := `{"number":42,"url":"https://github.com/test/repo/pull/42","state":"OPEN","baseRefName":"main","headRefName":"feature","baseRepository":{"url":"https://github.com/test/repo"},"headRepository":{"url":"https://github.com/test/repo"}}`
+	env := fakeCIGH(t, "OPEN", `[]`)
+	sctx.Env = append(env,
+		"FAKE_CLI_PR_TARGET_JSON="+targetJSON,
+		"FAKE_CLI_PR_BODY_FILE="+bodyFile,
+		"FAKE_CLI_PR_TITLE=feat: hand rolled",
+		"FAKE_CLI_LOG="+logFile,
+	)
+
+	if _, err := (&PushStep{}).Execute(sctx); err != nil {
+		t.Fatalf("push step failed: %v", err)
+	}
+
+	remoteHead := gitCmd(t, upstream, "rev-parse", "refs/heads/feature")
+	if remoteHead != newHead {
+		t.Fatalf("remote head = %s, want %s", remoteHead, newHead)
+	}
+	updated := readFakeGHBodyArg(t, logFile)
+	if !strings.Contains(updated, manualBody) {
+		t.Fatalf("bootstrap lost manual PR body:\n%s", updated)
+	}
+	if got, out := runVerifyPy(t, updated, newHead); got != "success" {
+		t.Fatalf("bound manual PR must be attested before push, got %s\n%s", got, out)
+	}
+}
+
 // TestPushStep_SkipsGhOnBaseBranch confirms attestHeadBeforePush skips a
 // direct push to the configured PR base branch entirely, without building an
 // SCM host or making any gh call at all - the PR step never manages a PR

@@ -100,6 +100,18 @@ type PR struct {
 	BaseBranch string
 }
 
+// PRTarget is the live identity facts for an operator-selected pull request.
+// Unlike PR, it carries both repositories so a pipeline can prove that its
+// configured parent repository and its configured push remote are the two
+// sides of the same pull request before it writes or publishes anything.
+type PRTarget struct {
+	PR
+	State             PRState
+	HeadBranch        string
+	BaseRepositoryURL string
+	HeadRepositoryURL string
+}
+
 // PRContent is the title + body for creating or updating a PR.
 type PRContent struct {
 	Title string
@@ -235,6 +247,13 @@ type ReviewCommentsHost interface {
 // rest of the body or inventing an attestation that was not already there.
 type PRContentReader interface {
 	GetPRContent(ctx context.Context, pr *PR) (PRContent, error)
+}
+
+// PRTargetReader reads one explicitly selected pull request and its live
+// repository and ref identity. It intentionally accepts a URL rather than a
+// branch name: callers using it must never fall back to branch discovery.
+type PRTargetReader interface {
+	GetPRTarget(ctx context.Context, targetURL string) (*PRTarget, error)
 }
 
 // MergedProof is provider evidence that a specific PR head was merged.

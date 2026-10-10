@@ -236,6 +236,27 @@ func parsePullRequestURL(raw, expectedHost, expectedRepo string) (int, error) {
 	return number, nil
 }
 
+// CanonicalPRURL validates the narrow public AXI target format. A canonical
+// URL is required because it becomes immutable launch identity: accepting
+// aliases, queries, fragments, or a number without a repository would make a
+// later duplicate comparison select a target by implication.
+func CanonicalPRURL(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	parsed, err := url.Parse(trimmed)
+	if err != nil || parsed.Hostname() == "" {
+		return "", errors.New("expected canonical GitHub pull request URL")
+	}
+	if _, err := parsePullRequestURL(trimmed, parsed.Hostname(), ""); err != nil {
+		return "", err
+	}
+	segments := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+	canonical := "https://" + strings.ToLower(parsed.Hostname()) + "/" + segments[0] + "/" + segments[1] + "/pull/" + segments[3]
+	if trimmed != canonical {
+		return "", fmt.Errorf("expected canonical GitHub pull request URL %q", canonical)
+	}
+	return canonical, nil
+}
+
 func (h *Host) FindPR(ctx context.Context, branch, base string) (*scm.PR, error) {
 	args := []string{"pr", "list", "--head", branch}
 	if strings.TrimSpace(base) != "" {
@@ -308,6 +329,70 @@ func (h *Host) FindPR(ctx context.Context, branch, base string) (*scm.PR, error)
 		return pr, nil
 	}
 	return nil, nil
+}
+
+var _ scm.PRTargetReader = (*Host)(nil)
+
+// GetPRTarget reads the one pull request selected by an operator-supplied URL.
+// It deliberately does not use FindPR: selecting a sibling by branch after an
+// explicit target failed is exactly the unsafe fallback target-bound runs must
+// avoid. The URL selector also works from the daemon's detached gate checkout.
+func (h *Host) GetPRTarget(ctx context.Context, targetURL string) (*scm.PRTarget, error) {
+	requestedNumber, err := parsePullRequestURL(targetURL, h.host, "")
+	if err != nil {
+		return nil, fmt.Errorf("invalid explicit GitHub pull request URL: %w", err)
+	}
+	args := []string{"pr", "view", strings.TrimSpace(targetURL), "--json", "number,url,state,baseRefName,headRefName,baseRepository,headRepository"}
+	out, err := h.cmd(ctx, "gh", args...).Output()
+	if err != nil {
+		return nil, fmt.Errorf("gh pr view explicit target: %w", err)
+	}
+	var parsed struct {
+		Number         int    `json:"number"`
+		URL            string `json:"url"`
+		State          string `json:"state"`
+		BaseRefName    string `json:"baseRefName"`
+		HeadRefName    string `json:"headRefName"`
+		BaseRepository *struct {
+			URL string `json:"url"`
+		} `json:"baseRepository"`
+		HeadRepository *struct {
+			URL string `json:"url"`
+		} `json:"headRepository"`
+	}
+	if err := json.Unmarshal(out, &parsed); err != nil {
+		return nil, fmt.Errorf("parse gh explicit pull request target JSON: %w", err)
+	}
+	if parsed.Number <= 0 || parsed.Number != requestedNumber {
+		return nil, fmt.Errorf("explicit GitHub pull request target returned an ambiguous number %d", parsed.Number)
+	}
+	returnedNumber, err := parsePullRequestURL(parsed.URL, h.host, "")
+	if err != nil || returnedNumber != requestedNumber {
+		if err != nil {
+			return nil, fmt.Errorf("explicit GitHub pull request target returned an invalid URL: %w", err)
+		}
+		return nil, fmt.Errorf("explicit GitHub pull request target returned an ambiguous URL %q", parsed.URL)
+	}
+	if parsed.BaseRepository == nil || strings.TrimSpace(parsed.BaseRepository.URL) == "" {
+		return nil, errors.New("explicit GitHub pull request target has no base repository")
+	}
+	if parsed.HeadRepository == nil || strings.TrimSpace(parsed.HeadRepository.URL) == "" {
+		return nil, errors.New("explicit GitHub pull request target has no head repository")
+	}
+	if strings.TrimSpace(parsed.BaseRefName) == "" || strings.TrimSpace(parsed.HeadRefName) == "" {
+		return nil, errors.New("explicit GitHub pull request target has an incomplete branch identity")
+	}
+	return &scm.PRTarget{
+		PR: scm.PR{
+			Number:     strconv.Itoa(parsed.Number),
+			URL:        strings.TrimSpace(parsed.URL),
+			BaseBranch: strings.TrimSpace(parsed.BaseRefName),
+		},
+		State:             normalizePRState(strings.TrimSpace(parsed.State)),
+		HeadBranch:        strings.TrimSpace(parsed.HeadRefName),
+		BaseRepositoryURL: strings.TrimSpace(parsed.BaseRepository.URL),
+		HeadRepositoryURL: strings.TrimSpace(parsed.HeadRepository.URL),
+	}, nil
 }
 
 func (h *Host) matchesHead(headRefName string, owner *struct {

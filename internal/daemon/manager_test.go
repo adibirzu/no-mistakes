@@ -183,6 +183,7 @@ func TestProofLaunchReceiptPushCrashWindowConcurrentClaimsAndImmutableReplay(t *
 	repo, headSHA := setupTestGitRepo(t, p, d, "proof-push-repo")
 	const generation = "generation-push-001"
 	const intent = "opaque push intent"
+	const prTargetURL = "https://github.com/test/repo/pull/42"
 	gitCmd(t, repo.WorkingPath, "branch", "review/base")
 	gitCmd(t, repo.WorkingPath, "push", "gate", "review/base:refs/heads/review/base")
 
@@ -197,6 +198,7 @@ func TestProofLaunchReceiptPushCrashWindowConcurrentClaimsAndImmutableReplay(t *
 		Old: "0000000000000000000000000000000000000000", New: headSHA,
 		Intent: intent, LaunchNonce: "push-nonce", ValidationGeneration: generation,
 		PRBaseBranch: " review/base ",
+		PRTargetURL:  prTargetURL,
 	}, &pushed); err != nil {
 		t.Fatal(err)
 	}
@@ -214,6 +216,14 @@ func TestProofLaunchReceiptPushCrashWindowConcurrentClaimsAndImmutableReplay(t *
 	if err == nil || !strings.Contains(err.Error(), "different pr base branch") {
 		t.Fatalf("mismatched fresh launch err = %v, want base mismatch", err)
 	}
+	err = client.Call(ipc.MethodStartFreshRun, &ipc.StartFreshRunParams{
+		RepoID: repo.ID, Branch: "main", HeadSHA: headSHA, Intent: intent,
+		LaunchNonce: "push-nonce", ValidationGeneration: generation, PRBaseBranch: "review/base",
+		PRTargetURL: "https://github.com/test/repo/pull/43",
+	}, &freshMismatch)
+	if err == nil || !strings.Contains(err.Error(), "different pr target") {
+		t.Fatalf("mismatched fresh target err = %v, want target mismatch", err)
+	}
 
 	var mismatched ipc.ClaimLaunchReceiptResult
 	err = client.Call(ipc.MethodClaimLaunchReceipt, &ipc.ClaimLaunchReceiptParams{
@@ -223,6 +233,22 @@ func TestProofLaunchReceiptPushCrashWindowConcurrentClaimsAndImmutableReplay(t *
 	}, &mismatched)
 	if err == nil || !strings.Contains(err.Error(), "different pr base branch") {
 		t.Fatalf("mismatched base claim err = %v, want base mismatch", err)
+	}
+	err = client.Call(ipc.MethodClaimLaunchReceipt, &ipc.ClaimLaunchReceiptParams{
+		RepoID: repo.ID, Branch: "main", LaunchNonce: "push-nonce",
+		SubmittedHeadSHA: headSHA, ValidationGeneration: generation, IntentDigest: digestIntent(intent),
+		PRBaseBranch: "review/base", PRTargetURL: "https://github.com/test/repo/pull/43",
+	}, &mismatched)
+	if err == nil || !strings.Contains(err.Error(), "different pr target") {
+		t.Fatalf("mismatched target claim err = %v, want target mismatch", err)
+	}
+	err = client.Call(ipc.MethodClaimLaunchReceipt, &ipc.ClaimLaunchReceiptParams{
+		RepoID: repo.ID, Branch: "main", LaunchNonce: "push-nonce",
+		SubmittedHeadSHA: headSHA, ValidationGeneration: generation, IntentDigest: digestIntent(intent),
+		PRBaseBranch: "review/base",
+	}, &mismatched)
+	if err == nil || !strings.Contains(err.Error(), "different pr target") {
+		t.Fatalf("omitted target claim err = %v, want target mismatch", err)
 	}
 	logLaunchEvidence(t, "base-conflict", err.Error())
 	stored, err := d.GetRun(pushed.RunID)
@@ -241,7 +267,7 @@ func TestProofLaunchReceiptPushCrashWindowConcurrentClaimsAndImmutableReplay(t *
 				var result ipc.StartFreshRunResult
 				err = c.Call(ipc.MethodStartFreshRun, &ipc.StartFreshRunParams{
 					RepoID: repo.ID, Branch: "main", HeadSHA: headSHA, Intent: intent,
-					LaunchNonce: "push-nonce", ValidationGeneration: generation,
+					LaunchNonce: "push-nonce", ValidationGeneration: generation, PRTargetURL: prTargetURL,
 				}, &result)
 				results <- result
 			}
@@ -274,7 +300,7 @@ func TestProofLaunchReceiptPushCrashWindowConcurrentClaimsAndImmutableReplay(t *
 	if err := client.Call(ipc.MethodStartFreshRun, &ipc.StartFreshRunParams{
 		RepoID: repo.ID, Branch: "main", HeadSHA: headSHA, Intent: intent,
 		LaunchNonce: "push-nonce", ValidationGeneration: generation,
-		PRBaseBranch: " review/base ",
+		PRBaseBranch: " review/base ", PRTargetURL: prTargetURL,
 	}, &replay); err != nil {
 		t.Fatal(err)
 	}
@@ -282,7 +308,7 @@ func TestProofLaunchReceiptPushCrashWindowConcurrentClaimsAndImmutableReplay(t *
 		t.Fatalf("immutable replay receipt = %#v, want submitted head %q", replay.Receipt, headSHA)
 	}
 	stored, err = d.GetRun(pushed.RunID)
-	if err != nil || stored == nil || stored.PRBaseBranch == nil || *stored.PRBaseBranch != "review/base" {
+	if err != nil || stored == nil || stored.PRBaseBranch == nil || *stored.PRBaseBranch != "review/base" || stored.PRTargetURL == nil || *stored.PRTargetURL != prTargetURL {
 		t.Fatalf("persisted proof base branch = %#v, err=%v", stored, err)
 	}
 	logLaunchEvidence(t, "advanced-head-replay", replay.Receipt)
@@ -921,6 +947,47 @@ func TestRerunInheritsPRBaseBranchFromSelectedRun(t *testing.T) {
 	got := waitForRunTerminalState(t, d, rerun.RunID)
 	if got.PRBaseBranch == nil || *got.PRBaseBranch != "epic/feature" {
 		t.Fatalf("rerun PRBaseBranch = %#v, want inherited epic/feature", got.PRBaseBranch)
+	}
+}
+
+func TestRerunInheritsPRTargetURLFromSelectedRun(t *testing.T) {
+	step := &mockPassStep{name: types.StepReview}
+	p, d := startTestDaemonWithSteps(t, func() []pipeline.Step {
+		return []pipeline.Step{step}
+	})
+
+	repo, headSHA := setupTestGitRepo(t, p, d, "pr-target-rerun-repo")
+	const prTargetURL = "https://github.com/test/repo/pull/42"
+	client, err := ipc.Dial(p.Socket())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	var first ipc.PushReceivedResult
+	err = client.Call(ipc.MethodPushReceived, &ipc.PushReceivedParams{
+		Gate: p.RepoDir(repo.ID), Ref: "refs/heads/main",
+		Old: "0000000000000000000000000000000000000000", New: headSHA,
+		PRTargetURL: prTargetURL,
+	}, &first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstRun := waitForRunTerminalState(t, d, first.RunID)
+	if firstRun.PRTargetURL == nil || *firstRun.PRTargetURL != prTargetURL {
+		t.Fatalf("first run PRTargetURL = %#v, want %q", firstRun.PRTargetURL, prTargetURL)
+	}
+
+	var rerun ipc.RerunResult
+	err = client.Call(ipc.MethodRerun, &ipc.RerunParams{
+		RepoID: repo.ID, Branch: "main", PreviousRunID: first.RunID,
+	}, &rerun)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := waitForRunTerminalState(t, d, rerun.RunID)
+	if got.PRTargetURL == nil || *got.PRTargetURL != prTargetURL {
+		t.Fatalf("rerun PRTargetURL = %#v, want inherited %q", got.PRTargetURL, prTargetURL)
 	}
 }
 

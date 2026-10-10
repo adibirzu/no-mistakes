@@ -133,6 +133,23 @@ func publishRunHead(sctx *pipeline.StepContext, headBeingPushed, localRefUpdate 
 	if err := assertReviewApprovedPushHead(sctx, headBeingPushed); err != nil {
 		return err
 	}
+	// A target-bound run establishes the live PR identity before any remote
+	// branch can move. This is deliberately before force-with-lease inspection
+	// and the pre-push attestation write: an unreadable, closed, foreign, or
+	// divergent target cannot result in a push.
+	if runPRTargetURL(sctx) != "" {
+		provider := resolvedProvider(sctx)
+		host, reason := buildHost(sctx, provider)
+		if host == nil {
+			return fmt.Errorf("verify explicit pull request target before push: %s", reason)
+		}
+		if err := host.Available(ctx); err != nil {
+			return fmt.Errorf("verify explicit pull request target before push: %w", err)
+		}
+		if _, _, err := resolveExplicitPRTarget(sctx, host); err != nil {
+			return fmt.Errorf("verify explicit pull request target before push: %w", err)
+		}
+	}
 
 	// Decide whether force-pushing would discard commits the pipeline never saw.
 	// The lease is anchored to the remote-tracking ref the rebase step freshly

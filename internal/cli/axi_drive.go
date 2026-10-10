@@ -119,6 +119,7 @@ func newAxiRunCmd() *cobra.Command {
 	var launchNonce string
 	var validationGeneration string
 	var baseBranch string
+	var prTargetURL string
 	var wait time.Duration
 
 	cmd := &cobra.Command{
@@ -144,6 +145,10 @@ func newAxiRunCmd() *cobra.Command {
 			"--base-branch targets an integration branch other than the repository default\n" +
 			"for this run only (for example an epic branch). It overrides pr.base_branch\n" +
 			"in repo config and is persisted on the run for rebase, PR, and CI steps.\n\n" +
+			"--pr binds this run to one already-open GitHub pull request. It never\n" +
+			"discovers or creates another PR: before every update and before pushing,\n" +
+			"the pipeline verifies the PR URL, repository, base branch, head branch,\n" +
+			"and configured push remote. Any mismatch stops the run before mutation.\n\n" +
 			"The calling agent drives AXI approval gates but does not become the pipeline\n" +
 			"agent. The daemon requires a supported native agent binary, the `agent: cursor`\n" +
 			"ACP alias, or an explicit `acp:<target>` through `acpx`, and fails before the\n" +
@@ -158,6 +163,7 @@ func newAxiRunCmd() *cobra.Command {
 				"has_intent":       strings.TrimSpace(intent) != "",
 				"has_skip":         strings.TrimSpace(skipValue) != "",
 				"has_base_branch":  strings.TrimSpace(baseBranch) != "",
+				"has_pr_target":    strings.TrimSpace(prTargetURL) != "",
 				"has_launch_nonce": launchNonce != "",
 			}, func() error {
 				skipSteps, err := parseSkipSteps(skipValue)
@@ -165,7 +171,7 @@ func newAxiRunCmd() *cobra.Command {
 					return emitError(cmd, 2, err.Error(),
 						"Valid steps: intent, rebase, review, test, document, lint, push, pr, ci")
 				}
-				return runAxiRunWithLaunchProof(cmd, autoYes, skipSteps, intent, baseBranch, launchNonce, validationGeneration, wait)
+				return runAxiRunWithLaunchProof(cmd, autoYes, skipSteps, intent, baseBranch, prTargetURL, launchNonce, validationGeneration, wait)
 			})
 		},
 	}
@@ -175,15 +181,16 @@ func newAxiRunCmd() *cobra.Command {
 	cmd.Flags().StringVar(&launchNonce, "launch-nonce", "", "opaque nonce for a daemon-bound pre-drive launch receipt")
 	cmd.Flags().StringVar(&validationGeneration, "validation-generation", "", "opaque generation bound to --launch-nonce proof mode")
 	cmd.Flags().StringVar(&baseBranch, "base-branch", "", "integration branch to open the PR against for this run only (overrides pr.base_branch)")
+	cmd.Flags().StringVar(&prTargetURL, "pr", "", "canonical GitHub URL of an already-open pull request to update; never discovers or creates a replacement")
 	bindAxiWaitFlag(cmd, &wait)
 	return cmd
 }
 
 func runAxiRun(cmd *cobra.Command, autoYes bool, skipSteps []types.StepName, intent, baseBranch string) error {
-	return runAxiRunWithLaunchProof(cmd, autoYes, skipSteps, intent, baseBranch, "", "", defaultAxiWait)
+	return runAxiRunWithLaunchProof(cmd, autoYes, skipSteps, intent, baseBranch, "", "", "", defaultAxiWait)
 }
 
-func runAxiRunWithLaunchProof(cmd *cobra.Command, autoYes bool, skipSteps []types.StepName, intent, baseBranch, launchNonce, validationGeneration string, wait time.Duration) error {
+func runAxiRunWithLaunchProof(cmd *cobra.Command, autoYes bool, skipSteps []types.StepName, intent, baseBranch, prTargetURL, launchNonce, validationGeneration string, wait time.Duration) error {
 	if err := validateAxiWait(wait); err != nil {
 		return emitError(cmd, 2, err.Error(), "Pass a positive duration such as --wait 8m")
 	}
@@ -218,6 +225,13 @@ func runAxiRunWithLaunchProof(cmd *cobra.Command, autoYes bool, skipSteps []type
 			return emitError(cmd, 2, fmt.Sprintf("--base-branch: %v", err))
 		}
 	}
+	if strings.TrimSpace(prTargetURL) != "" {
+		canonical, err := steps.ValidateRunPRTargetURL(prTargetURL)
+		if err != nil {
+			return emitError(cmd, 2, fmt.Sprintf("--pr: %v", err))
+		}
+		prTargetURL = canonical
+	}
 
 	runID := ""
 	var launchReceipt *ipc.LaunchReceipt
@@ -225,7 +239,7 @@ func runAxiRunWithLaunchProof(cmd *cobra.Command, autoYes bool, skipSteps []type
 		if strings.TrimSpace(validationGeneration) == "" {
 			return emitError(cmd, 2, "--validation-generation is required with --launch-nonce")
 		}
-		receipt, err := claimLaunchReceipt(env.client, env.repo.ID, branch, launchNonce, headSHA, validationGeneration, digestLaunchIntent(intent), baseBranch)
+		receipt, err := claimLaunchReceipt(env.client, env.repo.ID, branch, launchNonce, headSHA, validationGeneration, digestLaunchIntent(intent), baseBranch, prTargetURL)
 		if err != nil {
 			return emitError(cmd, 1, fmt.Sprintf("claim launch receipt: %v", err))
 		}
@@ -248,6 +262,10 @@ func runAxiRunWithLaunchProof(cmd *cobra.Command, autoYes bool, skipSteps []type
 			if err := conflictingActiveRunPRBaseBranch(active, baseBranch); err != nil {
 				return emitError(cmd, 2, err.Error(),
 					"Omit --base-branch to reattach, or abort the active run before starting a new one")
+			}
+			if err := conflictingActiveRunPRTarget(active, prTargetURL); err != nil {
+				return emitError(cmd, 2, err.Error(),
+					"Omit --pr to reattach, or abort the active run before starting a new bound run")
 			}
 			runID = active.ID
 		}
@@ -276,12 +294,12 @@ func runAxiRunWithLaunchProof(cmd *cobra.Command, autoYes bool, skipSteps []type
 		}
 		var err error
 		if launchNonce != "" {
-			launchReceipt, err = triggerProofRun(ctx, env, branch, headSHA, skipSteps, intent, baseBranch, launchNonce, validationGeneration)
+			launchReceipt, err = triggerProofRun(ctx, env, branch, headSHA, skipSteps, intent, baseBranch, prTargetURL, launchNonce, validationGeneration)
 			if err == nil {
 				runID = launchReceipt.RunID
 			}
 		} else {
-			runID, err = triggerRun(ctx, env, branch, headSHA, skipSteps, intent, baseBranch)
+			runID, err = triggerRun(ctx, env, branch, headSHA, skipSteps, intent, baseBranch, prTargetURL)
 		}
 		if err != nil {
 			if ownershipErr, ok := err.(*branchOwnershipError); ok {
@@ -346,6 +364,24 @@ func conflictingActiveRunPRBaseBranch(run *ipc.RunInfo, requested string) error 
 		return fmt.Errorf("active run %s is already in progress without --base-branch %s", run.ID, requested)
 	}
 	return fmt.Errorf("active run %s is already targeting %s, not %s", run.ID, stored, requested)
+}
+
+func conflictingActiveRunPRTarget(run *ipc.RunInfo, requested string) error {
+	requested = strings.TrimSpace(requested)
+	if requested == "" || run == nil {
+		return nil
+	}
+	stored := ""
+	if run.PRTargetURL != nil {
+		stored = strings.TrimSpace(*run.PRTargetURL)
+	}
+	if stored == requested {
+		return nil
+	}
+	if stored == "" {
+		return fmt.Errorf("active run %s is already in progress without --pr %s", run.ID, requested)
+	}
+	return fmt.Errorf("active run %s is already bound to %s, not %s", run.ID, stored, requested)
 }
 
 func activeRunInfo(ctx context.Context, env *axiEnv, branch, headSHA string) (*ipc.RunInfo, error) {
@@ -505,12 +541,15 @@ func freshRunBranchOwnershipState(ctx context.Context, env *axiEnv) *branchsync.
 // the gate to trigger a pipeline, and falls back to a rerun when the push was a
 // no-op (the gate already had this commit). Callers must check for an existing
 // active run first (see activeRunID) and apply pre-flight guards.
-func triggerRun(ctx context.Context, env *axiEnv, branch, headSHA string, skipSteps []types.StepName, intent, baseBranch string) (string, error) {
+func triggerRun(ctx context.Context, env *axiEnv, branch, headSHA string, skipSteps []types.StepName, intent, baseBranch, prTargetURL string) (string, error) {
 	pushOptions := formatSkipPushOptions(skipSteps)
 	if opt := formatIntentPushOption(intent); opt != "" {
 		pushOptions = append(pushOptions, opt)
 	}
 	if opt := formatPRBaseBranchPushOption(baseBranch); opt != "" {
+		pushOptions = append(pushOptions, opt)
+	}
+	if opt := formatPRTargetPushOption(prTargetURL); opt != "" {
 		pushOptions = append(pushOptions, opt)
 	}
 	priorRunIDs, err := runIDsForHead(env.client, env.repo.ID, branch, headSHA)
@@ -542,7 +581,7 @@ func triggerRun(ctx context.Context, env *axiEnv, branch, headSHA string, skipSt
 	// No run appeared: the push was likely up-to-date. Refresh the caller's
 	// clean-head evidence because it may have changed while waiting above.
 	var rr ipc.RerunResult
-	params := rerunParams(env.repo.ID, branch, skipSteps, intent, baseBranch)
+	params := rerunParams(env.repo.ID, branch, skipSteps, intent, baseBranch, prTargetURL)
 	params.CallerHeadSHA, err = rerunCallerHead(ctx)
 	if err != nil {
 		return "", err
@@ -553,11 +592,11 @@ func triggerRun(ctx context.Context, env *axiEnv, branch, headSHA string, skipSt
 	return rr.RunID, nil
 }
 
-func claimLaunchReceipt(client *ipc.Client, repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intentDigest, baseBranch string) (*ipc.LaunchReceipt, error) {
+func claimLaunchReceipt(client *ipc.Client, repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intentDigest, baseBranch, prTargetURL string) (*ipc.LaunchReceipt, error) {
 	var result ipc.ClaimLaunchReceiptResult
 	if err := client.Call(ipc.MethodClaimLaunchReceipt, &ipc.ClaimLaunchReceiptParams{
 		RepoID: repoID, Branch: branch, LaunchNonce: launchNonce,
-		SubmittedHeadSHA: submittedHeadSHA, ValidationGeneration: validationGeneration, IntentDigest: intentDigest, PRBaseBranch: baseBranch,
+		SubmittedHeadSHA: submittedHeadSHA, ValidationGeneration: validationGeneration, IntentDigest: intentDigest, PRBaseBranch: baseBranch, PRTargetURL: prTargetURL,
 	}, &result); err != nil {
 		return nil, err
 	}
@@ -567,7 +606,7 @@ func claimLaunchReceipt(client *ipc.Client, repoID, branch, launchNonce, submitt
 // triggerProofRun captures the immutable submitted commit and waits only for
 // the matching nonce-bound receipt. Ordinary active-run heuristics never prove
 // strict launch identity.
-func triggerProofRun(ctx context.Context, env *axiEnv, branch, headSHA string, skipSteps []types.StepName, intent, baseBranch, launchNonce, validationGeneration string) (*ipc.LaunchReceipt, error) {
+func triggerProofRun(ctx context.Context, env *axiEnv, branch, headSHA string, skipSteps []types.StepName, intent, baseBranch, prTargetURL, launchNonce, validationGeneration string) (*ipc.LaunchReceipt, error) {
 	pushOptions := formatSkipPushOptions(skipSteps)
 	pushOptions = append(pushOptions,
 		formatIntentPushOption(intent),
@@ -575,6 +614,9 @@ func triggerProofRun(ctx context.Context, env *axiEnv, branch, headSHA string, s
 		formatValidationGenerationPushOption(validationGeneration),
 	)
 	if opt := formatPRBaseBranchPushOption(baseBranch); opt != "" {
+		pushOptions = append(pushOptions, opt)
+	}
+	if opt := formatPRTargetPushOption(prTargetURL); opt != "" {
 		pushOptions = append(pushOptions, opt)
 	}
 	if state := freshRunBranchOwnershipState(ctx, env); state != nil {
@@ -587,7 +629,7 @@ func triggerProofRun(ctx context.Context, env *axiEnv, branch, headSHA string, s
 		}
 		return nil, fmt.Errorf("push %q to gate: %w", branch, pushErr)
 	}
-	if receipt, err := waitForLaunchReceipt(ctx, env.client, env.repo.ID, branch, launchNonce, headSHA, validationGeneration, intent, baseBranch, triggerWaitTimeout); err != nil {
+	if receipt, err := waitForLaunchReceipt(ctx, env.client, env.repo.ID, branch, launchNonce, headSHA, validationGeneration, intent, baseBranch, prTargetURL, triggerWaitTimeout); err != nil {
 		return nil, err
 	} else if receipt != nil {
 		return receipt, nil
@@ -595,20 +637,20 @@ func triggerProofRun(ctx context.Context, env *axiEnv, branch, headSHA string, s
 	var result ipc.StartFreshRunResult
 	if err := env.client.Call(ipc.MethodStartFreshRun, &ipc.StartFreshRunParams{
 		RepoID: env.repo.ID, Branch: branch, HeadSHA: headSHA, SkipSteps: skipSteps,
-		Intent: intent, LaunchNonce: launchNonce, ValidationGeneration: validationGeneration, PRBaseBranch: baseBranch,
+		Intent: intent, LaunchNonce: launchNonce, ValidationGeneration: validationGeneration, PRBaseBranch: baseBranch, PRTargetURL: prTargetURL,
 	}, &result); err != nil {
 		return nil, fmt.Errorf("start fresh run: %w", err)
 	}
 	return &result.Receipt, nil
 }
 
-func waitForLaunchReceipt(ctx context.Context, client *ipc.Client, repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intent, baseBranch string, timeout time.Duration) (*ipc.LaunchReceipt, error) {
+func waitForLaunchReceipt(ctx context.Context, client *ipc.Client, repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, intent, baseBranch, prTargetURL string, timeout time.Duration) (*ipc.LaunchReceipt, error) {
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 	poll := time.NewTicker(150 * time.Millisecond)
 	defer poll.Stop()
 	for {
-		receipt, err := claimLaunchReceipt(client, repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, digestLaunchIntent(intent), baseBranch)
+		receipt, err := claimLaunchReceipt(client, repoID, branch, launchNonce, submittedHeadSHA, validationGeneration, digestLaunchIntent(intent), baseBranch, prTargetURL)
 		if err != nil {
 			return nil, err
 		}
@@ -703,8 +745,8 @@ func activeRunLookupParams(repoID, branch string) *ipc.GetActiveRunParams {
 	return &ipc.GetActiveRunParams{RepoID: repoID, Branch: branch}
 }
 
-func rerunParams(repoID, branch string, skipSteps []types.StepName, intent, baseBranch string) *ipc.RerunParams {
-	return &ipc.RerunParams{RepoID: repoID, Branch: branch, SkipSteps: skipSteps, Intent: intent, PRBaseBranch: baseBranch}
+func rerunParams(repoID, branch string, skipSteps []types.StepName, intent, baseBranch, prTargetURL string) *ipc.RerunParams {
+	return &ipc.RerunParams{RepoID: repoID, Branch: branch, SkipSteps: skipSteps, Intent: intent, PRBaseBranch: baseBranch, PRTargetURL: prTargetURL}
 }
 
 // emitLaunchReceipt writes the proof before driveRun subscribes, so callers
