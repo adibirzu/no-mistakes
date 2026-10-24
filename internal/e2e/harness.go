@@ -772,6 +772,13 @@ func buildBinaries(t *testing.T) (nmBin, fakeBin string) {
 			buildErr = err
 			return
 		}
+		var buildEnv []string
+		if gitDirOut, err := exec.Command("git", "-C", repoRoot, "rev-parse", "--path-format=absolute", "--git-dir").Output(); err == nil {
+			buildEnv = append(os.Environ(),
+				"GIT_DIR="+strings.TrimSpace(string(gitDirOut)),
+				"GIT_WORK_TREE="+repoRoot,
+			)
+		}
 		for _, target := range []struct {
 			out, pkg string
 		}{
@@ -780,6 +787,7 @@ func buildBinaries(t *testing.T) (nmBin, fakeBin string) {
 		} {
 			cmd := exec.Command("go", "build", "-o", target.out, target.pkg)
 			cmd.Dir = repoRoot
+			cmd.Env = buildEnv
 			out, err := cmd.CombinedOutput()
 			if err != nil {
 				buildErr = fmt.Errorf("build %s: %v\n%s", target.pkg, err, out)

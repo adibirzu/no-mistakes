@@ -2757,6 +2757,9 @@ func TestBoundArchiveUnverifiedMetadataSiblingRecoveryPreservesBothHeadsAndStamp
 	if refused.Recovered || refused.Changed || refused.Safety != "blocked_recover_archive_requires_keep_local" || refused.NextAction == nil || refused.NextAction.Command != "no-mistakes axi sync --recover --keep-local" {
 		t.Fatalf("plain recover after bind = %#v", refused)
 	}
+	if !strings.Contains(refused.Error, f.preserved) || !strings.Contains(refused.Error, f.sibling) || !strings.Contains(refused.Error, f.archiveRef) || !strings.Contains(refused.Error, f.submitted) {
+		t.Fatalf("plain recover refusal prose missing bound heads/ref: %q", refused.Error)
+	}
 	if got := mustRun(t, f.local, "for-each-ref", "--format=%(refname) %(objectname) %(symref)"); got != beforeLocalRefs {
 		t.Fatal("plain recover refusal changed local refs")
 	}
@@ -2924,6 +2927,92 @@ func TestBoundArchiveUnverifiedMetadataSiblingProofMatrixFailsClosed(t *testing.
 				mustRun(t, f.gate, "for-each-ref", "--format=%(refname) %(objectname) %(symref)"),
 			}, "\n---\n")
 		}
+		assertFailClosedInvariants := func(t *testing.T, want string) {
+			t.Helper()
+			before := gitSnapshot()
+			state := f.service.InspectCached(f.ctx)
+			if state.State != StatePipelineOwned || state.Safety != want || state.NextAction == nil || state.NextAction.Code != "inspect_and_reconcile_manually" {
+				t.Fatalf("detection refusal = %#v, want %s/inspect_and_reconcile_manually", state, want)
+			}
+			if after := gitSnapshot(); after != before {
+				t.Fatal("detection refusal mutated Git state")
+			}
+			for _, keep := range []bool{true, false} {
+				recovered := f.service.Recover(f.ctx, keep)
+				if recovered.Recovered || recovered.Changed || recovered.State != StatePipelineOwned || recovered.Safety != want {
+					t.Fatalf("recover(keep=%v) refusal = %#v, want %s", keep, recovered, want)
+				}
+				if after := gitSnapshot(); after != before {
+					t.Fatalf("recover(keep=%v) refusal mutated Git state", keep)
+				}
+			}
+			reloaded, err := f.db.GetRun(f.run.ID)
+			if err != nil || reloaded == nil {
+				t.Fatalf("reload run: %#v, %v", reloaded, err)
+			}
+			if reloaded.CustodyReturnedAt != nil || reloaded.Status != types.RunFailed || reloaded.HeadSHA != f.preserved || reloaded.ReviewApprovedHeadSHA != nil || reloaded.TerminalHeadVerifiedAt != nil || reloaded.LastPushedSHA != nil {
+				t.Fatalf("refusal mutated run authority/head invariants: %#v", reloaded)
+			}
+		}
+		restoreArchive := func() {
+			t.Helper()
+			_, _ = gitpkg.Run(f.ctx, f.local, "symbolic-ref", "--delete", f.archiveRef)
+			mustRun(t, f.local, "update-ref", f.archiveRef, f.sibling)
+			if state := f.service.InspectCached(f.ctx); state.Safety != "blocked_pipeline_owned_recoverable" {
+				t.Fatalf("restored archive did not revalidate: %#v", state)
+			}
+		}
+
+		t.Run("missing archive ref", func(t *testing.T) {
+			mustRun(t, f.local, "update-ref", "-d", f.archiveRef)
+			assertFailClosedInvariants(t, "blocked_recover_archive_missing")
+			restoreArchive()
+		})
+		t.Run("moved archive ref", func(t *testing.T) {
+			mustRun(t, f.local, "update-ref", f.archiveRef, f.submitted)
+			assertFailClosedInvariants(t, "blocked_recover_archive_moved")
+			restoreArchive()
+		})
+		t.Run("blob-replaced archive ref", func(t *testing.T) {
+			blobPath := filepath.Join(filepath.Dir(f.local), "unverified-archive-blob.txt")
+			mustWrite(t, blobPath, "not a commit\n")
+			blob := mustRun(t, f.local, "hash-object", "-w", blobPath)
+			looseRef := mustRun(t, f.local, "rev-parse", "--git-path", f.archiveRef)
+			if !filepath.IsAbs(looseRef) {
+				looseRef = filepath.Join(f.local, looseRef)
+			}
+			mustWrite(t, looseRef, blob+"\n")
+			assertFailClosedInvariants(t, "blocked_recover_archive_replaced")
+			restoreArchive()
+		})
+		t.Run("symbolic archive ref", func(t *testing.T) {
+			mustRun(t, f.local, "symbolic-ref", f.archiveRef, "refs/heads/feature/recover")
+			assertFailClosedInvariants(t, "blocked_recover_archive_symbolic")
+			restoreArchive()
+		})
+		t.Run("missing gate recorded head B", func(t *testing.T) {
+			mustRun(t, f.gate, "gc", "--prune=now")
+			if _, err := gitpkg.Run(f.ctx, f.gate, "cat-file", "-e", f.preserved+"^{commit}"); err == nil {
+				t.Fatal("expected unreferenced recorded head B to be pruned from gate")
+			}
+			assertFailClosedInvariants(t, "blocked_recover_preserved_head_missing")
+			pipeline := filepath.Join(filepath.Dir(f.local), "pipeline")
+			mustRun(t, pipeline, "push", f.gate, f.preserved+":refs/no-mistakes/test-restore-b")
+			mustRun(t, f.gate, "update-ref", "-d", "refs/no-mistakes/test-restore-b")
+			restoreArchive()
+		})
+		t.Run("missing gate sibling head B-prime", func(t *testing.T) {
+			mustRun(t, f.gate, "update-ref", "-d", f.archiveRef)
+			mustRun(t, f.gate, "update-ref", "refs/no-mistakes/test-keep-b", f.preserved)
+			mustRun(t, f.gate, "gc", "--prune=now")
+			mustRun(t, f.gate, "update-ref", "-d", "refs/no-mistakes/test-keep-b")
+			if _, err := gitpkg.Run(f.ctx, f.gate, "cat-file", "-e", f.sibling+"^{commit}"); err == nil {
+				t.Fatal("expected unreferenced sibling head B' to be pruned from gate")
+			}
+			assertFailClosedInvariants(t, "blocked_recover_preserved_head_missing")
+			mustRun(t, f.local, "push", f.gate, f.archiveRef+":"+f.archiveRef)
+			restoreArchive()
+		})
 
 		metadataCases := []struct {
 			name   string
@@ -2964,7 +3053,7 @@ func TestBoundArchiveUnverifiedMetadataSiblingProofMatrixFailsClosed(t *testing.
 		}
 
 		// Conflicting gate rewrite anchor refuses with blocked_recover_anchor_mismatch.
-		mustRun(t, f.gate, "update-ref", custody.RecoveryRewriteRef(f.run.ID), f.otherSib)
+		mustRun(t, f.gate, "update-ref", custody.RecoveryRewriteRef(f.run.ID), f.preserved)
 		if refused := f.service.Recover(f.ctx, true); refused.Recovered || refused.Safety != "blocked_recover_anchor_mismatch" {
 			t.Fatalf("conflicting rewrite anchor recover = %#v, want blocked_recover_anchor_mismatch", refused)
 		}

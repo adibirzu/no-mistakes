@@ -736,7 +736,11 @@ func (s *Service) Recover(ctx context.Context, keepLocal bool) State {
 				return source.apply(state)
 			}
 			if !keepLocal {
-				blocked := blockedPlan(state, StatePipelineOwned, "blocked_recover_archive_requires_keep_local", fmt.Sprintf("the later pipeline head %s is preserved at %s, but it diverges from required head %s; run only the offered keep-local custody recovery; no files or refs were changed", preserved, source.archive.ArchiveRef, source.archive.RequiredHeadSHA))
+				msg := fmt.Sprintf("the later pipeline head %s is preserved at %s, but it diverges from required head %s; run only the offered keep-local custody recovery; no files or refs were changed", source.archive.PreservedHeadSHA, source.archive.ArchiveRef, source.archive.RequiredHeadSHA)
+				if run.TerminalHeadVerifiedAt == nil {
+					msg = fmt.Sprintf("the unverified pipeline head %s and metadata-equivalent sibling %s at %s cannot be adopted by plain recovery; run only the offered keep-local custody recovery at required head %s; no files or refs were changed", preserved, source.archive.PreservedHeadSHA, source.archive.ArchiveRef, source.archive.RequiredHeadSHA)
+				}
+				blocked := blockedPlan(state, StatePipelineOwned, "blocked_recover_archive_requires_keep_local", msg)
 				blocked.Recovery = source.evidence
 				blocked.NextAction = &NextAction{Code: "recover_custody", Command: "no-mistakes axi sync --recover --keep-local"}
 				return blocked
