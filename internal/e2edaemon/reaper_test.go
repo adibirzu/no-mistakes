@@ -43,6 +43,12 @@ func buildTestNMBin(t *testing.T) string {
 	}
 	cmd := exec.Command("go", "build", "-o", bin, "./cmd/no-mistakes")
 	cmd.Dir = repoRoot
+	if gitDirOut, err := exec.Command("git", "-C", repoRoot, "rev-parse", "--path-format=absolute", "--git-dir").Output(); err == nil {
+		cmd.Env = append(os.Environ(),
+			"GIT_DIR="+strings.TrimSpace(string(gitDirOut)),
+			"GIT_WORK_TREE="+repoRoot,
+		)
+	}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("build no-mistakes: %v\n%s", err, out)

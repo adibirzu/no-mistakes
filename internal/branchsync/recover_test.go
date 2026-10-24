@@ -106,6 +106,7 @@ func newRecoverFixture(t *testing.T, status types.RunStatus) *recoverFixture {
 	// onto the gate branch; nothing is ever pushed to the upstream.
 	gate := filepath.Join(root, "gate.git")
 	mustRun(t, root, "init", "--bare", gate)
+	configureIdentity(t, gate)
 	mustRun(t, local, "push", gate, "refs/heads/feature/recover:refs/heads/feature/recover")
 	pipeline := filepath.Join(root, "pipeline")
 	mustRun(t, root, "-c", "core.autocrlf=false", "clone", gate, pipeline)
@@ -1027,6 +1028,7 @@ func newUnmovedRecoverFixture(t *testing.T, status types.RunStatus) *recoverFixt
 	// the pipeline committed anything: preserved head == submitted head.
 	gate := filepath.Join(root, "gate.git")
 	mustRun(t, root, "init", "--bare", gate)
+	configureIdentity(t, gate)
 	mustRun(t, local, "push", gate, "refs/heads/feature/recover:refs/heads/feature/recover")
 
 	database, err := db.Open(filepath.Join(root, "state.sqlite"))
@@ -2592,4 +2594,540 @@ func TestRecoverSquashedPreservedHeadStillEscalatesForDroppedLocalWork(t *testin
 	if f.custodyReturned() {
 		t.Fatal("dropped-work escalation stamped custody")
 	}
+}
+
+type unverifiedSiblingFixture struct {
+	*recoverFixture
+	sibling    string
+	otherSib   string
+	archiveRef string
+}
+
+func newUnverifiedSiblingArchiveRecoverFixture(t *testing.T) *unverifiedSiblingFixture {
+	t.Helper()
+	ctx := context.Background()
+	root := t.TempDir()
+	remote := filepath.Join(root, "upstream.git")
+	mustRun(t, root, "init", "--bare", remote)
+
+	local := filepath.Join(root, "operator")
+	mustRun(t, root, "init", "-b", "main", local)
+	configureIdentity(t, local)
+	mustWrite(t, filepath.Join(local, "file.txt"), "base\n")
+	mustRun(t, local, "add", "file.txt")
+	mustRun(t, local, "commit", "-m", "base")
+	base := mustRun(t, local, "rev-parse", "HEAD")
+
+	mustRun(t, local, "checkout", "-b", "feature/recover")
+	mustWrite(t, filepath.Join(local, "file.txt"), "submitted feature A\n")
+	mustRun(t, local, "commit", "-am", "submitted feature A")
+	submitted := mustRun(t, local, "rev-parse", "HEAD")
+
+	mustWrite(t, filepath.Join(local, "fix.txt"), "review auto-fix before abort\n")
+	mustRun(t, local, "add", "fix.txt")
+	mustRun(t, local, "-c", "user.name=Pipeline First", "commit", "-m", "no-mistakes(review): fix round B")
+	recordedB := mustRun(t, local, "rev-parse", "HEAD")
+
+	// Metadata-only sibling B': identical Git tree and identical ordered parent(s)
+	// descending from A, differing only in commit metadata.
+	mustRun(t, local, "-c", "user.name=Pipeline Rewrite", "commit", "--amend", "-m", "no-mistakes(review): fix round B-prime")
+	siblingBPrime := mustRun(t, local, "rev-parse", "HEAD")
+
+	// Second unbound metadata sibling B'': proves recovery never scans arbitrary
+	// siblings and anchors only the operator-bound archive target B'.
+	mustRun(t, local, "-c", "user.name=Pipeline Unbound", "commit", "--amend", "-m", "no-mistakes(review): fix round B-double-prime")
+	otherSibling := mustRun(t, local, "rev-parse", "HEAD")
+
+	archiveRef := "refs/heads/archive/preserve-rewrite"
+	mustRun(t, local, "update-ref", archiveRef, siblingBPrime)
+	mustRun(t, local, "reset", "--hard", submitted)
+
+	gate := filepath.Join(root, "gate.git")
+	mustRun(t, root, "init", "--bare", gate)
+	configureIdentity(t, gate)
+	mustRun(t, local, "push", gate,
+		"refs/heads/feature/recover:refs/heads/feature/recover",
+		recordedB+":refs/no-mistakes/test-temp-b",
+		otherSibling+":refs/no-mistakes/test-temp-other",
+		siblingBPrime+":"+archiveRef,
+	)
+	mustRun(t, gate, "update-ref", "-d", "refs/no-mistakes/test-temp-b")
+	mustRun(t, gate, "update-ref", "-d", "refs/no-mistakes/test-temp-other")
+
+	database, err := db.Open(filepath.Join(root, "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	repo, err := database.InsertRepo(local, remote, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := database.InsertRun(repo.ID, "feature/recover", submitted, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpdateRunHeadSHA(run.ID, recordedB); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpdateRunStatus(run.ID, types.RunFailed); err != nil {
+		t.Fatal(err)
+	}
+	// Populate diagnostic error text naming the unbound sibling so tests prove
+	// run.Error is diagnostic-only and never parsed or trusted as provenance.
+	if err := database.UpdateRunError(run.ID, "step review failed: worktree head "+otherSibling+" does not match recorded run head "+recordedB); err != nil {
+		t.Fatal(err)
+	}
+	run, err = database.GetRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return &unverifiedSiblingFixture{
+		recoverFixture: &recoverFixture{
+			t: t, ctx: ctx, db: database, repo: repo, run: run,
+			service:   &Service{DB: database, Repo: repo, WorkDir: local, GateDir: gate},
+			local:     local,
+			gate:      gate,
+			remote:    remote,
+			base:      base,
+			submitted: submitted,
+			preserved: recordedB,
+		},
+		sibling:    siblingBPrime,
+		otherSib:   otherSibling,
+		archiveRef: archiveRef,
+	}
+}
+
+func TestBoundArchiveUnverifiedMetadataSiblingRecoveryPreservesBothHeadsAndStampsCustodyOnly(t *testing.T) {
+	t.Parallel()
+
+	f := newUnverifiedSiblingArchiveRecoverFixture(t)
+
+	// 1. Before binding: status must NOT offer ordinary `sync --recover` when
+	// TerminalHeadVerifiedAt is nil and the live gate branch (A) does not descend
+	// from recorded head B, even though B exists as a commit object in the gate.
+	unboundState := f.service.InspectCached(f.ctx)
+	assertManualReconciliationOffer(t, unboundState)
+
+	if refusedPlain := f.service.Recover(f.ctx, false); refusedPlain.Recovered || refusedPlain.Changed || refusedPlain.Safety != "blocked_recover_unverified_head" {
+		t.Fatalf("unbound plain recover = %#v, want blocked_recover_unverified_head", refusedPlain)
+	}
+	if refusedKeep := f.service.Recover(f.ctx, true); refusedKeep.Recovered || refusedKeep.Changed || refusedKeep.Safety != "blocked_recover_unverified_head" {
+		t.Fatalf("unbound keep-local recover = %#v, want blocked_recover_unverified_head", refusedKeep)
+	}
+	if f.custodyReturned() {
+		t.Fatal("unbound recover stamped custody")
+	}
+
+	// 2. Bind the exact archive ref pointing at B': no Git refs move.
+	beforeLocalRefs := mustRun(t, f.local, "for-each-ref", "--format=%(refname) %(objectname) %(symref)")
+	beforeGateRefs := mustRun(t, f.gate, "for-each-ref", "--format=%(refname) %(objectname) %(symref)")
+	bound := f.service.BindRecoveryArchive(f.ctx, f.archiveRef)
+	if bound.State != StatePipelineOwned || bound.Safety != "blocked_pipeline_owned_recoverable" {
+		t.Fatalf("bound state = %#v", bound)
+	}
+	if bound.Recovery == nil || bound.Recovery.Proof != "verified" || !bound.Recovery.KeepLocal || bound.Recovery.RequiredHead != f.submitted || bound.Recovery.PreservedHead != f.sibling || bound.Recovery.ArchiveRef != f.archiveRef {
+		t.Fatalf("bound recovery evidence = %#v", bound.Recovery)
+	}
+	if bound.NextAction == nil || bound.NextAction.Code != "recover_custody" || bound.NextAction.Command != "no-mistakes axi sync --recover --keep-local" {
+		t.Fatalf("bound next action = %#v", bound.NextAction)
+	}
+	if got := mustRun(t, f.local, "for-each-ref", "--format=%(refname) %(objectname) %(symref)"); got != beforeLocalRefs {
+		t.Fatal("binding archive changed local refs")
+	}
+	if got := mustRun(t, f.gate, "for-each-ref", "--format=%(refname) %(objectname) %(symref)"); got != beforeGateRefs {
+		t.Fatal("binding archive changed gate refs")
+	}
+
+	// Re-binding the exact same archive ref is idempotent; binding a different one refuses.
+	if again := f.service.BindRecoveryArchive(f.ctx, f.archiveRef); again.Safety != "blocked_pipeline_owned_recoverable" {
+		t.Fatalf("idempotent re-bind = %#v", again)
+	}
+	secondArchive := "refs/heads/archive/other-candidate"
+	mustRun(t, f.local, "update-ref", secondArchive, f.sibling)
+	if ambig := f.service.BindRecoveryArchive(f.ctx, secondArchive); ambig.Safety != "blocked_recover_archive_ambiguous" {
+		t.Fatalf("second candidate bind = %#v, want blocked_recover_archive_ambiguous", ambig)
+	}
+	mustRun(t, f.local, "update-ref", "-d", secondArchive)
+
+	// 3. Plain `--recover` refuses with zero Git or DB mutations.
+	refused := f.service.Recover(f.ctx, false)
+	if refused.Recovered || refused.Changed || refused.Safety != "blocked_recover_archive_requires_keep_local" || refused.NextAction == nil || refused.NextAction.Command != "no-mistakes axi sync --recover --keep-local" {
+		t.Fatalf("plain recover after bind = %#v", refused)
+	}
+	if !strings.Contains(refused.Error, f.preserved) || !strings.Contains(refused.Error, f.sibling) || !strings.Contains(refused.Error, f.archiveRef) || !strings.Contains(refused.Error, f.submitted) {
+		t.Fatalf("plain recover refusal prose missing bound heads/ref: %q", refused.Error)
+	}
+	if got := mustRun(t, f.local, "for-each-ref", "--format=%(refname) %(objectname) %(symref)"); got != beforeLocalRefs {
+		t.Fatal("plain recover refusal changed local refs")
+	}
+	if got := mustRun(t, f.gate, "for-each-ref", "--format=%(refname) %(objectname) %(symref)"); got != beforeGateRefs {
+		t.Fatal("plain recover refusal changed gate refs")
+	}
+	if f.custodyReturned() {
+		t.Fatal("plain recover refusal stamped custody")
+	}
+
+	// 4. `--recover --keep-local` preserves B and B' under immutable owner anchors,
+	// leaves local/live gate at A and Run.HeadSHA at B, and stamps ONLY CustodyReturnedAt.
+	recovered := f.service.Recover(f.ctx, true)
+	if !recovered.Recovered || recovered.Changed || recovered.State != StateCustodyReturned {
+		t.Fatalf("keep-local recovery = %#v", recovered)
+	}
+	if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.submitted {
+		t.Fatalf("local HEAD = %s, want %s", got, f.submitted)
+	}
+	if got := mustRun(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != f.submitted {
+		t.Fatalf("gate branch = %s, want %s", got, f.submitted)
+	}
+	if got := mustRun(t, f.gate, "rev-parse", custody.RecoveryRef(f.run.ID)+"^{commit}"); got != f.preserved {
+		t.Fatalf("gate recovery ref = %s, want recorded head B %s", got, f.preserved)
+	}
+	if got := mustRun(t, f.gate, "rev-parse", custody.RecoveryRewriteRef(f.run.ID)+"^{commit}"); got != f.sibling {
+		t.Fatalf("gate rewrite recovery ref = %s, want bound sibling B' %s", got, f.sibling)
+	}
+	if got := mustRun(t, f.local, "rev-parse", f.archiveRef); got != f.sibling {
+		t.Fatalf("local archive ref = %s, want %s", got, f.sibling)
+	}
+
+	reloaded, err := f.db.GetRun(f.run.ID)
+	if err != nil || reloaded == nil {
+		t.Fatalf("reload run: %#v, %v", reloaded, err)
+	}
+	if reloaded.CustodyReturnedAt == nil {
+		t.Fatal("CustodyReturnedAt was not stamped")
+	}
+	if reloaded.Status != types.RunFailed {
+		t.Fatalf("run status = %s, want %s", reloaded.Status, types.RunFailed)
+	}
+	if reloaded.HeadSHA != f.preserved {
+		t.Fatalf("run HeadSHA = %s, want unchanged B %s", reloaded.HeadSHA, f.preserved)
+	}
+	if reloaded.SubmittedHeadSHA == nil || *reloaded.SubmittedHeadSHA != f.submitted {
+		t.Fatalf("run SubmittedHeadSHA = %#v, want %s", reloaded.SubmittedHeadSHA, f.submitted)
+	}
+	if reloaded.ReviewApprovedHeadSHA != nil || reloaded.TerminalHeadVerifiedAt != nil || reloaded.LastPushedSHA != nil {
+		t.Fatalf("approval/verification/push fields must remain nil: review=%#v terminal=%#v pushed=%#v", reloaded.ReviewApprovedHeadSHA, reloaded.TerminalHeadVerifiedAt, reloaded.LastPushedSHA)
+	}
+
+	// 5. Both B and B' survive `git gc --prune=now` via the owner anchors in the
+	// gate even if the mutable archive branch in the gate is deleted, while the
+	// unbound sibling B'' is pruned.
+	mustRun(t, f.gate, "update-ref", "-d", f.archiveRef)
+	mustRun(t, f.gate, "gc", "--prune=now")
+	if got := mustRun(t, f.gate, "cat-file", "-t", f.preserved); got != "commit" {
+		t.Fatalf("recorded head B did not survive git gc: %s", got)
+	}
+	if got := mustRun(t, f.gate, "cat-file", "-t", f.sibling); got != "commit" {
+		t.Fatalf("bound sibling B' did not survive git gc: %s", got)
+	}
+
+	// 6. Idempotence: subsequent Recover calls (with or without --keep-local) are
+	// no-ops that keep custody_returned and leave verification fields nil.
+	firstStamp := *reloaded.CustodyReturnedAt
+	for _, keep := range []bool{true, false} {
+		idem := f.service.Recover(f.ctx, keep)
+		if !idem.Recovered || idem.Changed || idem.State != StateCustodyReturned {
+			t.Fatalf("idempotent recover(keep=%v) = %#v", keep, idem)
+		}
+		againRun, err := f.db.GetRun(f.run.ID)
+		if err != nil || againRun.CustodyReturnedAt == nil || *againRun.CustodyReturnedAt != firstStamp || againRun.ReviewApprovedHeadSHA != nil || againRun.TerminalHeadVerifiedAt != nil || againRun.HeadSHA != f.preserved {
+			t.Fatalf("run after idempotent recover(keep=%v) = %#v, %v", keep, againRun, err)
+		}
+	}
+}
+
+func TestBoundArchiveUnverifiedMetadataSiblingProofMatrixFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	f := newUnverifiedSiblingArchiveRecoverFixture(t)
+
+	t.Run("mismatched tree and mismatched ordered parents refuse to bind", func(t *testing.T) {
+		baseTree := mustRun(t, f.local, "rev-parse", f.base+"^{tree}")
+		recordedTree := mustRun(t, f.local, "rev-parse", f.preserved+"^{tree}")
+
+		// Different tree with same parent A.
+		diffTreeSHA := mustRun(t, f.local, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit-tree", baseTree, "-p", f.submitted, "-m", "different tree")
+		diffTreeRef := "refs/heads/archive/diff-tree"
+		// Identical tree to B, but different parent (base instead of submitted A).
+		diffParentSHA := mustRun(t, f.local, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit-tree", recordedTree, "-p", f.base, "-m", "same tree wrong parent")
+		diffParentRef := "refs/heads/archive/diff-parent"
+		// Identical tree to B, but swapped ordered parents [base, submitted] vs [submitted, base].
+		mergeB := mustRun(t, f.local, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit-tree", recordedTree, "-p", f.submitted, "-p", f.base, "-m", "merge B")
+		mergeSwapped := mustRun(t, f.local, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit-tree", recordedTree, "-p", f.base, "-p", f.submitted, "-m", "merge B swapped")
+		swappedRef := "refs/heads/archive/swapped-parents"
+		sameAsRecordedRef := "refs/heads/archive/same-as-recorded"
+
+		for ref, sha := range map[string]string{
+			diffTreeRef:       diffTreeSHA,
+			diffParentRef:     diffParentSHA,
+			swappedRef:        mergeSwapped,
+			sameAsRecordedRef: f.preserved,
+		} {
+			mustRun(t, f.local, "update-ref", ref, sha)
+		}
+		mustRun(t, f.local, "push", f.gate,
+			diffTreeSHA+":"+diffTreeRef,
+			diffParentSHA+":"+diffParentRef,
+			mergeSwapped+":"+swappedRef,
+			mergeB+":refs/no-mistakes/test-temp-mergeb",
+			f.preserved+":"+sameAsRecordedRef,
+		)
+		mustRun(t, f.gate, "update-ref", "-d", "refs/no-mistakes/test-temp-mergeb")
+
+		if state := f.service.BindRecoveryArchive(f.ctx, diffTreeRef); state.Safety != "blocked_recover_archive_preserved_head_mismatch" {
+			t.Fatalf("diff-tree bind = %#v, want blocked_recover_archive_preserved_head_mismatch", state)
+		}
+		if state := f.service.BindRecoveryArchive(f.ctx, diffParentRef); state.Safety != "blocked_recover_archive_preserved_head_mismatch" {
+			t.Fatalf("diff-parent bind = %#v, want blocked_recover_archive_preserved_head_mismatch", state)
+		}
+		if err := f.db.UpdateRunHeadSHA(f.run.ID, mergeB); err != nil {
+			t.Fatal(err)
+		}
+		if state := f.service.BindRecoveryArchive(f.ctx, swappedRef); state.Safety != "blocked_recover_archive_preserved_head_mismatch" {
+			t.Fatalf("swapped-parents bind = %#v, want blocked_recover_archive_preserved_head_mismatch", state)
+		}
+		if err := f.db.UpdateRunHeadSHA(f.run.ID, f.preserved); err != nil {
+			t.Fatal(err)
+		}
+		if state := f.service.BindRecoveryArchive(f.ctx, sameAsRecordedRef); state.Safety != "blocked_recover_archive_unverified_head" {
+			t.Fatalf("same-as-recorded bind = %#v, want blocked_recover_archive_unverified_head", state)
+		}
+		for _, ref := range []string{diffTreeRef, diffParentRef, swappedRef, sameAsRecordedRef} {
+			mustRun(t, f.local, "update-ref", "-d", ref)
+			mustRun(t, f.gate, "update-ref", "-d", ref)
+		}
+
+		records, err := f.db.GetRecoveryArchivesByRun(f.run.ID)
+		if err != nil || len(records) != 0 {
+			t.Fatalf("unexpected archive records after refused binds = %#v, %v", records, err)
+		}
+	})
+
+	t.Run("record and ref mutations fail closed without Git or DB mutation", func(t *testing.T) {
+		if bound := f.service.BindRecoveryArchive(f.ctx, f.archiveRef); bound.Safety != "blocked_pipeline_owned_recoverable" {
+			t.Fatalf("bind = %#v", bound)
+		}
+		records, err := f.db.GetRecoveryArchivesByRun(f.run.ID)
+		if err != nil || len(records) != 1 {
+			t.Fatalf("records = %#v, %v", records, err)
+		}
+		validRecord := *records[0]
+		validState := f.service.InspectCached(f.ctx)
+
+		gitSnapshot := func() string {
+			return strings.Join([]string{
+				mustRun(t, f.local, "rev-parse", "HEAD"),
+				mustRun(t, f.local, "status", "--porcelain=v1", "--untracked-files=all"),
+				mustRun(t, f.local, "for-each-ref", "--format=%(refname) %(objectname) %(symref)"),
+				mustRun(t, f.gate, "for-each-ref", "--format=%(refname) %(objectname) %(symref)"),
+			}, "\n---\n")
+		}
+		assertFailClosedInvariants := func(t *testing.T, want string) {
+			t.Helper()
+			before := gitSnapshot()
+			state := f.service.InspectCached(f.ctx)
+			if state.State != StatePipelineOwned || state.Safety != want || state.NextAction == nil || state.NextAction.Code != "inspect_and_reconcile_manually" {
+				t.Fatalf("detection refusal = %#v, want %s/inspect_and_reconcile_manually", state, want)
+			}
+			for _, keep := range []bool{true, false} {
+				recovered := f.service.Recover(f.ctx, keep)
+				if recovered.Recovered || recovered.Changed || recovered.State != StatePipelineOwned || recovered.Safety != want {
+					t.Fatalf("recover(keep=%v) refusal = %#v, want %s", keep, recovered, want)
+				}
+			}
+			if after := gitSnapshot(); after != before {
+				t.Fatal("refusal mutated Git state")
+			}
+			reloaded, err := f.db.GetRun(f.run.ID)
+			if err != nil || reloaded == nil {
+				t.Fatalf("reload run: %#v, %v", reloaded, err)
+			}
+			if reloaded.CustodyReturnedAt != nil || reloaded.Status != types.RunFailed || reloaded.HeadSHA != f.preserved || reloaded.ReviewApprovedHeadSHA != nil || reloaded.TerminalHeadVerifiedAt != nil || reloaded.LastPushedSHA != nil {
+				t.Fatalf("refusal mutated run authority/head invariants: %#v", reloaded)
+			}
+		}
+		restoreArchive := func() {
+			t.Helper()
+			_, _ = gitpkg.Run(f.ctx, f.local, "symbolic-ref", "--delete", f.archiveRef)
+			mustRun(t, f.local, "update-ref", f.archiveRef, f.sibling)
+		}
+
+		t.Run("missing archive ref", func(t *testing.T) {
+			mustRun(t, f.local, "update-ref", "-d", f.archiveRef)
+			assertFailClosedInvariants(t, "blocked_recover_archive_missing")
+			restoreArchive()
+		})
+		t.Run("moved archive ref", func(t *testing.T) {
+			mustRun(t, f.local, "update-ref", f.archiveRef, f.submitted)
+			assertFailClosedInvariants(t, "blocked_recover_archive_moved")
+			restoreArchive()
+		})
+		t.Run("blob-replaced archive ref", func(t *testing.T) {
+			blobPath := filepath.Join(filepath.Dir(f.local), "unverified-archive-blob.txt")
+			mustWrite(t, blobPath, "not a commit\n")
+			blob := mustRun(t, f.local, "hash-object", "-w", blobPath)
+			looseRef := mustRun(t, f.local, "rev-parse", "--git-path", f.archiveRef)
+			if !filepath.IsAbs(looseRef) {
+				looseRef = filepath.Join(f.local, looseRef)
+			}
+			mustWrite(t, looseRef, blob+"\n")
+			assertFailClosedInvariants(t, "blocked_recover_archive_replaced")
+			restoreArchive()
+		})
+		t.Run("tree-replaced archive ref", func(t *testing.T) {
+			baseTree := mustRun(t, f.local, "rev-parse", f.base+"^{tree}")
+			looseRef := mustRun(t, f.local, "rev-parse", "--git-path", f.archiveRef)
+			if !filepath.IsAbs(looseRef) {
+				looseRef = filepath.Join(f.local, looseRef)
+			}
+			mustWrite(t, looseRef, baseTree+"\n")
+			assertFailClosedInvariants(t, "blocked_recover_archive_replaced")
+			restoreArchive()
+		})
+		t.Run("symbolic archive ref", func(t *testing.T) {
+			mustRun(t, f.local, "symbolic-ref", f.archiveRef, "refs/heads/feature/recover")
+			assertFailClosedInvariants(t, "blocked_recover_archive_symbolic")
+			restoreArchive()
+		})
+		t.Run("missing gate recorded head B", func(t *testing.T) {
+			mustRun(t, f.gate, "gc", "--prune=now")
+			if _, err := gitpkg.Run(f.ctx, f.gate, "cat-file", "-e", f.preserved+"^{commit}"); err == nil {
+				t.Fatal("expected unreferenced recorded head B to be pruned from gate")
+			}
+			assertFailClosedInvariants(t, "blocked_recover_preserved_head_missing")
+			mustRun(t, f.local, "push", f.gate, f.preserved+":refs/no-mistakes/test-restore-b")
+			mustRun(t, f.gate, "update-ref", "-d", "refs/no-mistakes/test-restore-b")
+			restoreArchive()
+		})
+		t.Run("missing gate sibling head B-prime", func(t *testing.T) {
+			mustRun(t, f.gate, "update-ref", "-d", f.archiveRef)
+			mustRun(t, f.gate, "update-ref", "refs/no-mistakes/test-keep-b", f.preserved)
+			mustRun(t, f.gate, "gc", "--prune=now")
+			mustRun(t, f.gate, "update-ref", "-d", "refs/no-mistakes/test-keep-b")
+			if _, err := gitpkg.Run(f.ctx, f.gate, "cat-file", "-e", f.sibling+"^{commit}"); err == nil {
+				t.Fatal("expected unreferenced sibling head B' to be pruned from gate")
+			}
+			assertFailClosedInvariants(t, "blocked_recover_preserved_head_missing")
+			mustRun(t, f.local, "push", f.gate, f.archiveRef+":"+f.archiveRef)
+			restoreArchive()
+		})
+
+		metadataCases := []struct {
+			name   string
+			want   string
+			mutate func(*db.RecoveryArchive, *db.Run)
+		}{
+			{name: "malformed archive ref", want: "blocked_recover_archive_malformed", mutate: func(rec *db.RecoveryArchive, _ *db.Run) { rec.ArchiveRef = "refs/tags/archive/bad" }},
+			{name: "wrong repo", want: "blocked_recover_archive_repository_mismatch", mutate: func(rec *db.RecoveryArchive, _ *db.Run) { rec.RepoID = "other-repo" }},
+			{name: "wrong owner run", want: "blocked_recover_archive_run_mismatch", mutate: func(rec *db.RecoveryArchive, _ *db.Run) { rec.OwnerRunID = "other-run" }},
+			{name: "wrong evidence run", want: "blocked_recover_archive_run_mismatch", mutate: func(rec *db.RecoveryArchive, _ *db.Run) { rec.RunID = "other-run" }},
+			{name: "wrong branch", want: "blocked_recover_archive_branch_mismatch", mutate: func(rec *db.RecoveryArchive, _ *db.Run) { rec.Branch = "other/branch" }},
+			{name: "wrong required head", want: "blocked_recover_archive_required_head_mismatch", mutate: func(rec *db.RecoveryArchive, _ *db.Run) { rec.RequiredHeadSHA = f.base }},
+			{name: "preserved head equals required head", want: "blocked_recover_archive_preserved_head_mismatch", mutate: func(rec *db.RecoveryArchive, _ *db.Run) { rec.PreservedHeadSHA = rec.RequiredHeadSHA }},
+			{name: "active run", want: "blocked_recover_archive_stale", mutate: func(_ *db.RecoveryArchive, run *db.Run) { run.Status = types.RunRunning }},
+			{name: "published run", want: "blocked_recover_archive_stale", mutate: func(_ *db.RecoveryArchive, run *db.Run) {
+				pushed := f.submitted
+				run.LastPushedSHA = &pushed
+			}},
+			{name: "review approved head set", want: "blocked_recover_archive_stale", mutate: func(_ *db.RecoveryArchive, run *db.Run) {
+				approved := f.preserved
+				run.ReviewApprovedHeadSHA = &approved
+			}},
+		}
+		beforeMeta := gitSnapshot()
+		for _, tc := range metadataCases {
+			t.Run(tc.name, func(t *testing.T) {
+				rec := validRecord
+				run := *f.run
+				tc.mutate(&rec, &run)
+				proof := f.service.verifyRecoveryArchiveRecord(f.ctx, &validState, &run, &rec)
+				if proof.available || proof.safety != tc.want {
+					t.Fatalf("proof = %#v, want %s", proof, tc.want)
+				}
+			})
+		}
+		if afterMeta := gitSnapshot(); afterMeta != beforeMeta {
+			t.Fatal("metadata refusal mutated Git state")
+		}
+
+		// Conflicting gate rewrite anchor refuses with blocked_recover_anchor_mismatch.
+		mustRun(t, f.gate, "update-ref", custody.RecoveryRewriteRef(f.run.ID), f.preserved)
+		if refused := f.service.Recover(f.ctx, true); refused.Recovered || refused.Safety != "blocked_recover_anchor_mismatch" {
+			t.Fatalf("conflicting rewrite anchor recover = %#v, want blocked_recover_anchor_mismatch", refused)
+		}
+		mustRun(t, f.gate, "update-ref", "-d", custody.RecoveryRewriteRef(f.run.ID))
+
+		// Dirty worktree refuses with blocked_recover_archive_dirty.
+		mustWrite(t, filepath.Join(f.local, "file.txt"), "dirty local edit\n")
+		if refused := f.service.Recover(f.ctx, true); refused.Recovered || refused.Safety != "blocked_recover_archive_dirty" {
+			t.Fatalf("dirty worktree recover = %#v, want blocked_recover_archive_dirty", refused)
+		}
+		mustWrite(t, filepath.Join(f.local, "file.txt"), "submitted feature A\n")
+
+		// Moved gate branch refuses with blocked_recover_archive_gate_head_mismatch.
+		mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", f.sibling, f.submitted)
+		if refused := f.service.Recover(f.ctx, true); refused.Recovered || refused.Safety != "blocked_recover_archive_gate_head_mismatch" {
+			t.Fatalf("moved gate branch recover = %#v, want blocked_recover_archive_gate_head_mismatch", refused)
+		}
+		mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", f.submitted, f.sibling)
+		if f.custodyReturned() {
+			t.Fatal("refusal case stamped custody")
+		}
+	})
+}
+
+func TestBoundArchiveUnverifiedMetadataSiblingRaceAndCASRefusal(t *testing.T) {
+	t.Parallel()
+
+	t.Run("gate branch race before custody stamp refuses without stamping custody", func(t *testing.T) {
+		t.Parallel()
+		f := newUnverifiedSiblingArchiveRecoverFixture(t)
+		if bound := f.service.BindRecoveryArchive(f.ctx, f.archiveRef); bound.Safety != "blocked_pipeline_owned_recoverable" {
+			t.Fatalf("bind = %#v", bound)
+		}
+		f.service.beforeCustodyStamp = func() {
+			mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", f.sibling, f.submitted)
+		}
+		state := f.service.Recover(f.ctx, true)
+		if state.Recovered || state.Changed || state.Safety != "blocked_recover_gate_race" {
+			t.Fatalf("gate race recover = %#v, want blocked_recover_gate_race", state)
+		}
+		if f.custodyReturned() {
+			t.Fatal("gate race stamped custody")
+		}
+		// Both owner anchors were still preserved before the stamp refusal.
+		if got := mustRun(t, f.gate, "rev-parse", custody.RecoveryRef(f.run.ID)+"^{commit}"); got != f.preserved {
+			t.Fatalf("gate recovery ref = %s, want %s", got, f.preserved)
+		}
+		if got := mustRun(t, f.gate, "rev-parse", custody.RecoveryRewriteRef(f.run.ID)+"^{commit}"); got != f.sibling {
+			t.Fatalf("gate rewrite recovery ref = %s, want %s", got, f.sibling)
+		}
+	})
+
+	t.Run("DB CAS mismatch before custody stamp refuses without stamping custody or losing anchors", func(t *testing.T) {
+		t.Parallel()
+		f := newUnverifiedSiblingArchiveRecoverFixture(t)
+		if bound := f.service.BindRecoveryArchive(f.ctx, f.archiveRef); bound.Safety != "blocked_pipeline_owned_recoverable" {
+			t.Fatalf("bind = %#v", bound)
+		}
+		f.service.beforeCustodyStamp = func() {
+			_ = f.db.UpdateRunReviewApprovedHeadSHA(f.run.ID, f.preserved)
+		}
+		state := f.service.Recover(f.ctx, true)
+		if state.Recovered || state.Changed || state.Safety != "blocked_recover_stamp_failed" {
+			t.Fatalf("DB CAS race recover = %#v, want blocked_recover_stamp_failed", state)
+		}
+		if f.custodyReturned() {
+			t.Fatal("DB CAS refusal stamped custody")
+		}
+		if got := mustRun(t, f.gate, "rev-parse", custody.RecoveryRef(f.run.ID)+"^{commit}"); got != f.preserved {
+			t.Fatalf("gate recovery ref = %s, want %s", got, f.preserved)
+		}
+		if got := mustRun(t, f.gate, "rev-parse", custody.RecoveryRewriteRef(f.run.ID)+"^{commit}"); got != f.sibling {
+			t.Fatalf("gate rewrite recovery ref = %s, want %s", got, f.sibling)
+		}
+	})
 }

@@ -236,6 +236,12 @@ func Init() (func() error, error) {
 	cmd := exec.Command("go", "build", "-trimpath", "-ldflags=-s -w", "-o", path, "./internal/pipeline/fakecli")
 	cmd.Dir = root
 	cmd.Env = goBuildEnvWithoutRace()
+	if gitDirOut, err := exec.Command("git", "-C", root, "rev-parse", "--path-format=absolute", "--git-dir").Output(); err == nil {
+		cmd.Env = append(cmd.Env,
+			"GIT_DIR="+strings.TrimSpace(string(gitDirOut)),
+			"GIT_WORK_TREE="+root,
+		)
+	}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		if cleanupErr := os.RemoveAll(dir); cleanupErr != nil {

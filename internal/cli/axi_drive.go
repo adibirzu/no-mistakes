@@ -47,12 +47,10 @@ func bindAxiWaitFlag(cmd *cobra.Command, wait *time.Duration) {
 	cmd.Flags().DurationVar(wait, "wait", defaultAxiWait, "maximum time to block driving this run before returning so the caller can reattach")
 }
 
-func boundAxiWait(ctx context.Context, wait time.Duration) (context.Context, context.CancelFunc, error) {
-	if err := validateAxiWait(wait); err != nil {
-		return nil, nil, err
-	}
-	ctx, cancel := context.WithTimeout(ctx, wait)
-	return ctx, cancel, nil
+var axiPreflightHook = func(ctx context.Context) error { return nil }
+
+func boundAxiWait(ctx context.Context, wait time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, wait)
 }
 
 func validateAxiWait(wait time.Duration) error {
@@ -195,11 +193,6 @@ func runAxiRunWithLaunchProof(cmd *cobra.Command, autoYes bool, skipSteps []type
 		return emitError(cmd, 2, err.Error(), "Pass a positive duration such as --wait 8m")
 	}
 	ctx := cmd.Context()
-	driveCtx, cancel, err := boundAxiWait(ctx, wait)
-	if err != nil {
-		return emitError(cmd, 2, err.Error(), "Pass a positive duration such as --wait 8m")
-	}
-	defer cancel()
 	env, err := openAxiRunEnv()
 	if err != nil {
 		return emitError(cmd, 1, err.Error(), repoInitHelp(err)...)
@@ -232,6 +225,11 @@ func runAxiRunWithLaunchProof(cmd *cobra.Command, autoYes bool, skipSteps []type
 		}
 		prTargetURL = canonical
 	}
+	if err := axiPreflightHook(ctx); err != nil {
+		return emitError(cmd, 1, fmt.Sprintf("preflight: %v", err))
+	}
+	driveCtx, cancel := boundAxiWait(ctx, wait)
+	defer cancel()
 
 	runID := ""
 	var launchReceipt *ipc.LaunchReceipt
@@ -1106,11 +1104,6 @@ func runAxiRespond(cmd *cobra.Command, ra respondArgs) error {
 		return emitError(cmd, 2, err.Error(), "Pass a positive duration such as --wait 8m")
 	}
 	ctx := cmd.Context()
-	driveCtx, cancel, err := boundAxiWait(ctx, ra.wait)
-	if err != nil {
-		return emitError(cmd, 2, err.Error(), "Pass a positive duration such as --wait 8m")
-	}
-	defer cancel()
 
 	act := types.ApprovalAction(strings.TrimSpace(ra.action))
 	switch act {
@@ -1132,6 +1125,11 @@ func runAxiRespond(cmd *cobra.Command, ra respondArgs) error {
 	if err != nil {
 		return emitError(cmd, 1, fmt.Sprintf("get current branch: %v", err))
 	}
+	if err := axiPreflightHook(ctx); err != nil {
+		return emitError(cmd, 1, fmt.Sprintf("preflight: %v", err))
+	}
+	driveCtx, cancel := boundAxiWait(ctx, ra.wait)
+	defer cancel()
 
 	var active ipc.GetActiveRunResult
 	source := &ipcRunStateSource{socketPath: env.p.Socket()}

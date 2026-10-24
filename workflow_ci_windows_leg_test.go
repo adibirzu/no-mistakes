@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -88,12 +89,29 @@ func windowsGoTestCommands(t *testing.T) []workflowCommand {
 func goListPackages(t *testing.T, patterns ...string) []string {
 	t.Helper()
 	cmd := exec.Command("go", append([]string{"list"}, patterns...)...)
-	out, err := cmd.Output()
+	repoRoot, err := filepath.Abs(".")
 	if err != nil {
-		t.Fatalf("go list %s: %v", strings.Join(patterns, " "), err)
+		t.Fatalf("resolve repo root: %v", err)
+	}
+	cmd.Dir = repoRoot
+	if gitDirOut, err := exec.Command("git", "-C", repoRoot, "rev-parse", "--path-format=absolute", "--git-dir").Output(); err == nil {
+		topLevel := repoRoot
+		if topLevelOut, err := exec.Command("git", "-C", repoRoot, "rev-parse", "--show-toplevel").Output(); err == nil {
+			topLevel = strings.TrimSpace(string(topLevelOut))
+		}
+		cmd.Env = append(os.Environ(),
+			"GIT_DIR="+strings.TrimSpace(string(gitDirOut)),
+			"GIT_WORK_TREE="+topLevel,
+		)
+	}
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("go list %s: %v\n%s", strings.Join(patterns, " "), err, stderr.String())
 	}
 	var packages []string
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+	for _, line := range strings.Split(strings.TrimSpace(stdout.String()), "\n") {
 		line = strings.TrimSpace(line)
 		if line != "" {
 			packages = append(packages, line)

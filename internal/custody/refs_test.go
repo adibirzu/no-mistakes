@@ -24,6 +24,30 @@ func TestPreserveRecoveryHeadCreatesAnchorAndAcceptsSameCommit(t *testing.T) {
 	}
 }
 
+func TestPreserveRecoveryRewriteHeadCreatesAnchorAndRejectsConflict(t *testing.T) {
+	repo, head := recoveryTestRepo(t)
+	ctx := context.Background()
+
+	if err := PreserveRecoveryRewriteHead(ctx, repo, "run-1", head); err != nil {
+		t.Fatalf("create rewrite recovery anchor: %v", err)
+	}
+	if err := PreserveRecoveryRewriteHead(ctx, repo, "run-1", head); err != nil {
+		t.Fatalf("accept existing matching rewrite recovery anchor: %v", err)
+	}
+	if got := gitOutput(t, repo, "rev-parse", RecoveryRewriteRef("run-1")+"^{commit}"); got != head {
+		t.Fatalf("rewrite recovery anchor = %s, want %s", got, head)
+	}
+
+	gitRun(t, repo, "commit", "--allow-empty", "-m", "other")
+	other := gitOutput(t, repo, "rev-parse", "HEAD")
+	if err := PreserveRecoveryRewriteHead(ctx, repo, "run-1", other); err == nil || !strings.Contains(err.Error(), "conflicts") {
+		t.Fatalf("conflicting rewrite recovery anchor error = %v", err)
+	}
+	if got := gitOutput(t, repo, "rev-parse", RecoveryRewriteRef("run-1")+"^{commit}"); got != head {
+		t.Fatalf("rewrite recovery anchor overwritten: got %s, want %s", got, head)
+	}
+}
+
 func TestPreserveRecoveryHeadRejectsConflictingAnchorWithoutOverwriting(t *testing.T) {
 	repo, head := recoveryTestRepo(t)
 	gitRun(t, repo, "commit", "--allow-empty", "-m", "other")

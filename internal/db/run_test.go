@@ -1249,3 +1249,123 @@ func TestSetRunCustodyReturnedStampsOnceAndSurvivesStatusUpdates(t *testing.T) {
 		t.Fatalf("custody stamp changed: %#v, want %d", got.CustodyReturnedAt, first)
 	}
 }
+
+func TestSetRunCustodyReturnedUnverifiedCASStampsOnlyCustodyAndEnforcesExactPreconditions(t *testing.T) {
+	d := openTestDB(t)
+	repo, err := d.InsertRepo("/home/user/unverified-cas", "git@github.com:user/unverified-cas.git", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	newFailedUnverifiedRun := func(t *testing.T, branch string) *Run {
+		t.Helper()
+		run, err := d.InsertRun(repo.ID, branch, "head-a", "base-sha")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := d.UpdateRunHeadSHA(run.ID, "head-b"); err != nil {
+			t.Fatal(err)
+		}
+		if err := d.UpdateRunStatus(run.ID, types.RunFailed); err != nil {
+			t.Fatal(err)
+		}
+		fresh, err := d.GetRun(run.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return fresh
+	}
+
+	t.Run("stamps custody only when all unverified preconditions match", func(t *testing.T) {
+		run := newFailedUnverifiedRun(t, "feat-ok")
+		if err := d.SetRunCustodyReturnedUnverifiedCAS(run.ID, types.RunFailed, "head-b", "head-a"); err != nil {
+			t.Fatalf("SetRunCustodyReturnedUnverifiedCAS: %v", err)
+		}
+		got, err := d.GetRun(run.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.CustodyReturnedAt == nil {
+			t.Fatal("CustodyReturnedAt was not stamped")
+		}
+		if got.Status != types.RunFailed || got.HeadSHA != "head-b" {
+			t.Fatalf("run status/head mutated: status=%s head=%s", got.Status, got.HeadSHA)
+		}
+		if got.SubmittedHeadSHA == nil || *got.SubmittedHeadSHA != "head-a" {
+			t.Fatalf("SubmittedHeadSHA = %#v, want head-a", got.SubmittedHeadSHA)
+		}
+		if got.ReviewApprovedHeadSHA != nil || got.TerminalHeadVerifiedAt != nil || got.LastPushedSHA != nil {
+			t.Fatalf("verification/push fields were unexpectedly set: review=%#v terminal=%#v pushed=%#v", got.ReviewApprovedHeadSHA, got.TerminalHeadVerifiedAt, got.LastPushedSHA)
+		}
+		if err := d.SetRunCustodyReturnedUnverifiedCAS(run.ID, types.RunFailed, "head-b", "head-a"); err == nil {
+			t.Fatal("second CAS succeeded after custody_returned_at was already set")
+		}
+	})
+
+	t.Run("refuses mismatched arguments or non-null verification/push fields", func(t *testing.T) {
+		cases := []struct {
+			name   string
+			status types.RunStatus
+			head   string
+			sub    string
+			mutate func(*testing.T, *Run)
+		}{
+			{name: "active status argument", status: types.RunRunning, head: "head-b", sub: "head-a"},
+			{name: "wrong status", status: types.RunCancelled, head: "head-b", sub: "head-a"},
+			{name: "wrong recorded head", status: types.RunFailed, head: "other-b", sub: "head-a"},
+			{name: "wrong submitted head", status: types.RunFailed, head: "head-b", sub: "other-a"},
+			{name: "same submitted and recorded head", status: types.RunFailed, head: "head-a", sub: "head-a"},
+			{
+				name: "review approved head non-null", status: types.RunFailed, head: "head-b", sub: "head-a",
+				mutate: func(t *testing.T, r *Run) {
+					if err := d.UpdateRunReviewApprovedHeadSHA(r.ID, "head-b"); err != nil {
+						t.Fatal(err)
+					}
+				},
+			},
+			{
+				name: "terminal head verified non-null", status: types.RunFailed, head: "head-b", sub: "head-a",
+				mutate: func(t *testing.T, r *Run) {
+					if err := d.UpdateRunStatusWithVerifiedHead(r.ID, types.RunFailed, "head-b"); err != nil {
+						t.Fatal(err)
+					}
+				},
+			},
+			{
+				name: "push active", status: types.RunFailed, head: "head-b", sub: "head-a",
+				mutate: func(t *testing.T, r *Run) {
+					if err := d.SetRunPushActive(r.ID, true); err != nil {
+						t.Fatal(err)
+					}
+				},
+			},
+			{
+				name: "already pushed", status: types.RunFailed, head: "head-b", sub: "head-a",
+				mutate: func(t *testing.T, r *Run) {
+					if err := d.UpdateRunPushBinding(r.ID, PushBinding{
+						HeadSHA: "head-b", TargetKind: "upstream", TargetFingerprint: "fp", Ref: "refs/heads/" + r.Branch,
+					}); err != nil {
+						t.Fatal(err)
+					}
+				},
+			},
+		}
+		for i, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				run := newFailedUnverifiedRun(t, "feat-neg-"+string(rune('a'+i)))
+				if tc.mutate != nil {
+					tc.mutate(t, run)
+				}
+				if err := d.SetRunCustodyReturnedUnverifiedCAS(run.ID, tc.status, tc.head, tc.sub); err == nil {
+					t.Fatalf("SetRunCustodyReturnedUnverifiedCAS succeeded for %s", tc.name)
+				}
+				got, err := d.GetRun(run.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got.CustodyReturnedAt != nil {
+					t.Fatalf("CustodyReturnedAt was stamped on refused case %s", tc.name)
+				}
+			})
+		}
+	})
+}

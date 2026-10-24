@@ -1504,6 +1504,181 @@ func TestHumanSyncRecoverRequiresConfirmationOutsideTTY(t *testing.T) {
 	}
 }
 
+func TestAxiUnverifiedMetadataSiblingArchiveRecoveryPreservesBothHeadsAndStampsCustodyOnly(t *testing.T) {
+	nmHome := filepath.Join(t.TempDir(), "nm-home")
+	t.Setenv("NM_HOME", nmHome)
+	root := t.TempDir()
+	remote := filepath.Join(root, "remote.git")
+	cliGit(t, root, "init", "--bare", remote)
+
+	local := filepath.Join(root, "operator")
+	cliGit(t, root, "init", "-b", "main", local)
+	cliGit(t, local, "config", "user.name", "Test")
+	cliGit(t, local, "config", "user.email", "test@example.com")
+	if err := os.WriteFile(filepath.Join(local, "file.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cliGit(t, local, "add", "file.txt")
+	cliGit(t, local, "commit", "-m", "base")
+	base := cliGit(t, local, "rev-parse", "HEAD")
+	cliGit(t, local, "checkout", "-b", "feature/recover")
+	if err := os.WriteFile(filepath.Join(local, "file.txt"), []byte("submitted A\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cliGit(t, local, "commit", "-am", "submitted A")
+	submitted := cliGit(t, local, "rev-parse", "HEAD")
+
+	p, err := paths.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	database, err := db.Open(p.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	registeredRoot, err := git.FindGitRoot(local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, err := database.InsertRepo(registeredRoot, remote, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate := p.RepoDir(repo.ID)
+	cliGit(t, filepath.Dir(gate), "init", "--bare", gate)
+	cliGit(t, local, "push", gate, "refs/heads/feature/recover:refs/heads/feature/recover")
+
+	pipeline := filepath.Join(root, "pipeline")
+	cliGit(t, root, "-c", "core.autocrlf=false", "clone", gate, pipeline)
+	cliGit(t, pipeline, "config", "user.name", "Pipeline")
+	cliGit(t, pipeline, "config", "user.email", "pipeline@example.com")
+	cliGit(t, pipeline, "checkout", "feature/recover")
+	if err := os.WriteFile(filepath.Join(pipeline, "fix.txt"), []byte("auto-fix B\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cliGit(t, pipeline, "add", "fix.txt")
+	cliGit(t, pipeline, "-c", "user.name=Pipeline First", "commit", "-m", "no-mistakes(review): fix B")
+	recordedB := cliGit(t, pipeline, "rev-parse", "HEAD")
+	cliGit(t, pipeline, "-c", "user.name=Pipeline Rewrite", "commit", "--amend", "-m", "no-mistakes(review): fix B-prime")
+	siblingBPrime := cliGit(t, pipeline, "rev-parse", "HEAD")
+
+	archiveRef := "refs/heads/archive/preserve-rewrite"
+	cliGit(t, pipeline, "push", gate,
+		recordedB+":refs/no-mistakes/test-temp-b",
+		siblingBPrime+":"+archiveRef,
+	)
+	cliGit(t, gate, "update-ref", "-d", "refs/no-mistakes/test-temp-b")
+	cliGit(t, local, "fetch", "--no-tags", gate, archiveRef+":"+archiveRef)
+
+	run, err := database.InsertRun(repo.ID, "feature/recover", submitted, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpdateRunHeadSHA(run.ID, recordedB); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpdateRunStatus(run.ID, types.RunFailed); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	chdir(t, local)
+
+	var ee *exitError
+	statusBefore, err := executeCmd("axi", "status")
+	if err != nil && (!asExitError(err, &ee) || ee.code != 1) {
+		t.Fatalf("axi status before bind: %v\n%s", err, statusBefore)
+	}
+	if !strings.Contains(statusBefore, "safety: blocked_recover_manual_reconciliation") || strings.Contains(statusBefore, "command: no-mistakes axi sync --recover") {
+		t.Fatalf("unbound unverified status should not offer ordinary recover:\n%s", statusBefore)
+	}
+
+	boundOut, err := executeCmd("axi", "sync", "--bind-archive-ref", archiveRef)
+	if err != nil {
+		t.Fatalf("bind archive ref: %v\n%s", err, boundOut)
+	}
+	var boundDoc struct {
+		BranchSync struct {
+			State    string `toon:"state"`
+			Safety   string `toon:"safety"`
+			Recovery struct {
+				Source        string `toon:"source"`
+				RequiredHead  string `toon:"required_head"`
+				PreservedHead string `toon:"preserved_head"`
+				ArchiveRef    string `toon:"archive_ref"`
+				KeepLocal     bool   `toon:"keep_local"`
+				Proof         string `toon:"proof"`
+			} `toon:"recovery"`
+			NextAction struct {
+				Code    string `toon:"code"`
+				Command string `toon:"command"`
+			} `toon:"next_action"`
+		} `toon:"branch_sync"`
+	}
+	if err := toon.UnmarshalString(boundOut, &boundDoc); err != nil {
+		t.Fatalf("decode bind output: %v\n%s", err, boundOut)
+	}
+	if boundDoc.BranchSync.State != "pipeline_owned" ||
+		boundDoc.BranchSync.Safety != "blocked_pipeline_owned_recoverable" ||
+		boundDoc.BranchSync.Recovery.Source != "bound_archive" ||
+		boundDoc.BranchSync.Recovery.RequiredHead != submitted ||
+		boundDoc.BranchSync.Recovery.PreservedHead != siblingBPrime ||
+		boundDoc.BranchSync.Recovery.ArchiveRef != archiveRef ||
+		!boundDoc.BranchSync.Recovery.KeepLocal ||
+		boundDoc.BranchSync.Recovery.Proof != "verified" ||
+		boundDoc.BranchSync.NextAction.Code != "recover_custody" ||
+		boundDoc.BranchSync.NextAction.Command != "no-mistakes axi sync --recover --keep-local" {
+		t.Fatalf("unexpected bound document: %#v\n%s", boundDoc, boundOut)
+	}
+
+	refused, err := executeCmd("axi", "sync", "--recover")
+	if err == nil || !asExitError(err, &ee) || ee.code != 1 {
+		t.Fatalf("plain recover should refuse, got %#v\n%s", err, refused)
+	}
+	if !strings.Contains(refused, "blocked_recover_archive_requires_keep_local") {
+		t.Fatalf("plain recover refusal:\n%s", refused)
+	}
+
+	recovered, err := executeCmd("axi", "sync", "--recover", "--keep-local")
+	if err != nil {
+		t.Fatalf("keep-local recover: %v\n%s", err, recovered)
+	}
+	for _, want := range []string{"recovered: true", "changed: false", "state: custody_returned"} {
+		if !strings.Contains(recovered, want) {
+			t.Fatalf("recover output missing %q:\n%s", want, recovered)
+		}
+	}
+	if got := cliGit(t, local, "rev-parse", "HEAD"); got != submitted {
+		t.Fatalf("local HEAD = %s, want %s", got, submitted)
+	}
+	if got := cliGit(t, gate, "rev-parse", "refs/heads/feature/recover"); got != submitted {
+		t.Fatalf("gate branch = %s, want %s", got, submitted)
+	}
+	if got := cliGit(t, gate, "rev-parse", "refs/no-mistakes/recover/"+run.ID+"^{commit}"); got != recordedB {
+		t.Fatalf("gate recovery ref = %s, want %s", got, recordedB)
+	}
+	if got := cliGit(t, gate, "rev-parse", "refs/no-mistakes/recover-rewrite/"+run.ID+"^{commit}"); got != siblingBPrime {
+		t.Fatalf("gate rewrite recovery ref = %s, want %s", got, siblingBPrime)
+	}
+
+	reopened, err := db.Open(p.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	gotRun, err := reopened.GetRun(run.ID)
+	if err != nil || gotRun == nil {
+		t.Fatalf("reload run: %#v, %v", gotRun, err)
+	}
+	if gotRun.CustodyReturnedAt == nil || gotRun.Status != types.RunFailed || gotRun.HeadSHA != recordedB || gotRun.ReviewApprovedHeadSHA != nil || gotRun.TerminalHeadVerifiedAt != nil || gotRun.LastPushedSHA != nil {
+		t.Fatalf("unexpected run state after recovery: %#v", gotRun)
+	}
+}
+
 func cliGit(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	out, err := git.Run(context.Background(), dir, args...)
