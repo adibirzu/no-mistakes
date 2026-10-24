@@ -2357,22 +2357,27 @@ func sameTreeAndOrderedParents(ctx context.Context, gateDir, workDir, recordedHe
 	if recordedHead == "" || siblingHead == "" || recordedHead == siblingHead {
 		return false
 	}
-	recordedTree, errRec := git.Run(ctx, gateDir, "rev-parse", "--verify", recordedHead+"^{tree}")
-	gateSiblingTree, errGateSib := git.Run(ctx, gateDir, "rev-parse", "--verify", siblingHead+"^{tree}")
-	workSiblingTree, errWorkSib := git.Run(ctx, workDir, "rev-parse", "--verify", siblingHead+"^{tree}")
-	if errRec != nil || errGateSib != nil || errWorkSib != nil || recordedTree == "" || recordedTree != gateSiblingTree || recordedTree != workSiblingTree {
+	recordedTree, recordedParents, ok := commitTreeAndParents(ctx, gateDir, recordedHead)
+	if !ok {
 		return false
 	}
-	recordedParents, errRecP := git.Run(ctx, gateDir, "show", "-s", "--format=%P", recordedHead)
-	gateSiblingParents, errGateSibP := git.Run(ctx, gateDir, "show", "-s", "--format=%P", siblingHead)
-	workSiblingParents, errWorkSibP := git.Run(ctx, workDir, "show", "-s", "--format=%P", siblingHead)
-	if errRecP != nil || errGateSibP != nil || errWorkSibP != nil {
+	gateSiblingTree, gateSiblingParents, ok := commitTreeAndParents(ctx, gateDir, siblingHead)
+	if !ok || recordedTree != gateSiblingTree || recordedParents != gateSiblingParents {
 		return false
 	}
-	recordedParents = strings.TrimSpace(recordedParents)
-	gateSiblingParents = strings.TrimSpace(gateSiblingParents)
-	workSiblingParents = strings.TrimSpace(workSiblingParents)
-	return recordedParents != "" && recordedParents == gateSiblingParents && recordedParents == workSiblingParents
+	workSiblingTree, workSiblingParents, ok := commitTreeAndParents(ctx, workDir, siblingHead)
+	return ok && recordedTree == workSiblingTree && recordedParents == workSiblingParents
+}
+
+func commitTreeAndParents(ctx context.Context, repoDir, commitSHA string) (string, string, bool) {
+	out, err := git.Run(ctx, repoDir, "show", "-s", "--format=%T%n%P", commitSHA+"^{commit}")
+	if err != nil {
+		return "", "", false
+	}
+	tree, parents, ok := strings.Cut(out, "\n")
+	tree = strings.TrimSpace(tree)
+	parents = strings.TrimSpace(parents)
+	return tree, parents, ok && tree != "" && parents != ""
 }
 
 func archiveRequiredHead(state State, run *db.Run) (string, bool) {

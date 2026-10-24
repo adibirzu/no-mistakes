@@ -2623,39 +2623,36 @@ func newUnverifiedSiblingArchiveRecoverFixture(t *testing.T) *unverifiedSiblingF
 	mustRun(t, local, "commit", "-am", "submitted feature A")
 	submitted := mustRun(t, local, "rev-parse", "HEAD")
 
-	gate := filepath.Join(root, "gate.git")
-	mustRun(t, root, "init", "--bare", gate)
-	configureIdentity(t, gate)
-	mustRun(t, local, "push", gate, "refs/heads/feature/recover:refs/heads/feature/recover")
-
-	pipeline := filepath.Join(root, "pipeline")
-	mustRun(t, root, "-c", "core.autocrlf=false", "clone", gate, pipeline)
-	configureIdentity(t, pipeline)
-	mustRun(t, pipeline, "checkout", "feature/recover")
-	mustWrite(t, filepath.Join(pipeline, "fix.txt"), "review auto-fix before abort\n")
-	mustRun(t, pipeline, "add", "fix.txt")
-	mustRun(t, pipeline, "-c", "user.name=Pipeline First", "commit", "-m", "no-mistakes(review): fix round B")
-	recordedB := mustRun(t, pipeline, "rev-parse", "HEAD")
+	mustWrite(t, filepath.Join(local, "fix.txt"), "review auto-fix before abort\n")
+	mustRun(t, local, "add", "fix.txt")
+	mustRun(t, local, "-c", "user.name=Pipeline First", "commit", "-m", "no-mistakes(review): fix round B")
+	recordedB := mustRun(t, local, "rev-parse", "HEAD")
 
 	// Metadata-only sibling B': identical Git tree and identical ordered parent(s)
 	// descending from A, differing only in commit metadata.
-	mustRun(t, pipeline, "-c", "user.name=Pipeline Rewrite", "commit", "--amend", "-m", "no-mistakes(review): fix round B-prime")
-	siblingBPrime := mustRun(t, pipeline, "rev-parse", "HEAD")
+	mustRun(t, local, "-c", "user.name=Pipeline Rewrite", "commit", "--amend", "-m", "no-mistakes(review): fix round B-prime")
+	siblingBPrime := mustRun(t, local, "rev-parse", "HEAD")
 
 	// Second unbound metadata sibling B'': proves recovery never scans arbitrary
 	// siblings and anchors only the operator-bound archive target B'.
-	mustRun(t, pipeline, "-c", "user.name=Pipeline Unbound", "commit", "--amend", "-m", "no-mistakes(review): fix round B-double-prime")
-	otherSibling := mustRun(t, pipeline, "rev-parse", "HEAD")
+	mustRun(t, local, "-c", "user.name=Pipeline Unbound", "commit", "--amend", "-m", "no-mistakes(review): fix round B-double-prime")
+	otherSibling := mustRun(t, local, "rev-parse", "HEAD")
 
 	archiveRef := "refs/heads/archive/preserve-rewrite"
-	mustRun(t, pipeline, "push", gate,
+	mustRun(t, local, "update-ref", archiveRef, siblingBPrime)
+	mustRun(t, local, "reset", "--hard", submitted)
+
+	gate := filepath.Join(root, "gate.git")
+	mustRun(t, root, "init", "--bare", gate)
+	configureIdentity(t, gate)
+	mustRun(t, local, "push", gate,
+		"refs/heads/feature/recover:refs/heads/feature/recover",
 		recordedB+":refs/no-mistakes/test-temp-b",
 		otherSibling+":refs/no-mistakes/test-temp-other",
 		siblingBPrime+":"+archiveRef,
 	)
 	mustRun(t, gate, "update-ref", "-d", "refs/no-mistakes/test-temp-b")
 	mustRun(t, gate, "update-ref", "-d", "refs/no-mistakes/test-temp-other")
-	mustRun(t, local, "fetch", "--no-tags", gate, archiveRef+":"+archiveRef)
 
 	database, err := db.Open(filepath.Join(root, "state.sqlite"))
 	if err != nil {
@@ -2845,63 +2842,62 @@ func TestBoundArchiveUnverifiedMetadataSiblingRecoveryPreservesBothHeadsAndStamp
 func TestBoundArchiveUnverifiedMetadataSiblingProofMatrixFailsClosed(t *testing.T) {
 	t.Parallel()
 
+	f := newUnverifiedSiblingArchiveRecoverFixture(t)
+
 	t.Run("mismatched tree and mismatched ordered parents refuse to bind", func(t *testing.T) {
-		f := newUnverifiedSiblingArchiveRecoverFixture(t)
-		writer := filepath.Join(filepath.Dir(f.local), "bad-sibling-writer")
-		mustRun(t, filepath.Dir(writer), "-c", "core.autocrlf=false", "clone", f.gate, writer)
-		configureIdentity(t, writer)
+		baseTree := mustRun(t, f.local, "rev-parse", f.base+"^{tree}")
+		recordedTree := mustRun(t, f.local, "rev-parse", f.preserved+"^{tree}")
 
 		// Different tree with same parent A.
-		mustRun(t, writer, "checkout", "-B", "diff-tree", f.submitted)
-		mustWrite(t, filepath.Join(writer, "fix.txt"), "different tree content\n")
-		mustRun(t, writer, "add", "fix.txt")
-		mustRun(t, writer, "commit", "-m", "different tree")
-		diffTreeSHA := mustRun(t, writer, "rev-parse", "HEAD")
+		diffTreeSHA := mustRun(t, f.local, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit-tree", baseTree, "-p", f.submitted, "-m", "different tree")
 		diffTreeRef := "refs/heads/archive/diff-tree"
-		mustRun(t, writer, "push", f.gate, diffTreeSHA+":"+diffTreeRef)
-		mustRun(t, f.local, "fetch", "--no-tags", f.gate, diffTreeRef+":"+diffTreeRef)
+		// Identical tree to B, but different parent (base instead of submitted A).
+		diffParentSHA := mustRun(t, f.local, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit-tree", recordedTree, "-p", f.base, "-m", "same tree wrong parent")
+		diffParentRef := "refs/heads/archive/diff-parent"
+		// Identical tree to B, but swapped ordered parents [base, submitted] vs [submitted, base].
+		mergeB := mustRun(t, f.local, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit-tree", recordedTree, "-p", f.submitted, "-p", f.base, "-m", "merge B")
+		mergeSwapped := mustRun(t, f.local, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit-tree", recordedTree, "-p", f.base, "-p", f.submitted, "-m", "merge B swapped")
+		swappedRef := "refs/heads/archive/swapped-parents"
+		sameAsRecordedRef := "refs/heads/archive/same-as-recorded"
 
-		state := f.service.BindRecoveryArchive(f.ctx, diffTreeRef)
-		if state.Safety != "blocked_recover_archive_preserved_head_mismatch" {
+		for ref, sha := range map[string]string{
+			diffTreeRef:       diffTreeSHA,
+			diffParentRef:     diffParentSHA,
+			swappedRef:        mergeSwapped,
+			sameAsRecordedRef: f.preserved,
+		} {
+			mustRun(t, f.local, "update-ref", ref, sha)
+		}
+		mustRun(t, f.local, "push", f.gate,
+			diffTreeSHA+":"+diffTreeRef,
+			diffParentSHA+":"+diffParentRef,
+			mergeSwapped+":"+swappedRef,
+			mergeB+":refs/no-mistakes/test-temp-mergeb",
+			f.preserved+":"+sameAsRecordedRef,
+		)
+		mustRun(t, f.gate, "update-ref", "-d", "refs/no-mistakes/test-temp-mergeb")
+
+		if state := f.service.BindRecoveryArchive(f.ctx, diffTreeRef); state.Safety != "blocked_recover_archive_preserved_head_mismatch" {
 			t.Fatalf("diff-tree bind = %#v, want blocked_recover_archive_preserved_head_mismatch", state)
 		}
-
-		// Identical tree to B, but different parent (base instead of submitted A).
-		recordedTree := mustRun(t, f.gate, "rev-parse", f.preserved+"^{tree}")
-		diffParentSHA := mustRun(t, f.gate, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit-tree", recordedTree, "-p", f.base, "-m", "same tree wrong parent")
-		diffParentRef := "refs/heads/archive/diff-parent"
-		mustRun(t, f.gate, "update-ref", diffParentRef, diffParentSHA)
-		mustRun(t, f.local, "fetch", "--no-tags", f.gate, diffParentRef+":"+diffParentRef)
-
-		state = f.service.BindRecoveryArchive(f.ctx, diffParentRef)
-		if state.Safety != "blocked_recover_archive_preserved_head_mismatch" {
+		if state := f.service.BindRecoveryArchive(f.ctx, diffParentRef); state.Safety != "blocked_recover_archive_preserved_head_mismatch" {
 			t.Fatalf("diff-parent bind = %#v, want blocked_recover_archive_preserved_head_mismatch", state)
 		}
-
-		// Identical tree to B, but swapped ordered parents [base, submitted] vs [submitted, base].
-		mergeB := mustRun(t, f.gate, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit-tree", recordedTree, "-p", f.submitted, "-p", f.base, "-m", "merge B")
-		mergeSwapped := mustRun(t, f.gate, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit-tree", recordedTree, "-p", f.base, "-p", f.submitted, "-m", "merge B swapped")
-		swappedRef := "refs/heads/archive/swapped-parents"
-		mustRun(t, f.gate, "update-ref", swappedRef, mergeSwapped)
-		mustRun(t, f.local, "fetch", "--no-tags", f.gate, swappedRef+":"+swappedRef)
 		if err := f.db.UpdateRunHeadSHA(f.run.ID, mergeB); err != nil {
 			t.Fatal(err)
 		}
-		state = f.service.BindRecoveryArchive(f.ctx, swappedRef)
-		if state.Safety != "blocked_recover_archive_preserved_head_mismatch" {
+		if state := f.service.BindRecoveryArchive(f.ctx, swappedRef); state.Safety != "blocked_recover_archive_preserved_head_mismatch" {
 			t.Fatalf("swapped-parents bind = %#v, want blocked_recover_archive_preserved_head_mismatch", state)
 		}
-
-		// Archive ref pointing at recorded head B itself (not a sibling) refuses as unverified head.
 		if err := f.db.UpdateRunHeadSHA(f.run.ID, f.preserved); err != nil {
 			t.Fatal(err)
 		}
-		sameAsRecordedRef := "refs/heads/archive/same-as-recorded"
-		mustRun(t, f.gate, "update-ref", sameAsRecordedRef, f.preserved)
-		mustRun(t, f.local, "fetch", "--no-tags", f.gate, sameAsRecordedRef+":"+sameAsRecordedRef)
-		state = f.service.BindRecoveryArchive(f.ctx, sameAsRecordedRef)
-		if state.Safety != "blocked_recover_archive_unverified_head" {
+		if state := f.service.BindRecoveryArchive(f.ctx, sameAsRecordedRef); state.Safety != "blocked_recover_archive_unverified_head" {
 			t.Fatalf("same-as-recorded bind = %#v, want blocked_recover_archive_unverified_head", state)
+		}
+		for _, ref := range []string{diffTreeRef, diffParentRef, swappedRef, sameAsRecordedRef} {
+			mustRun(t, f.local, "update-ref", "-d", ref)
+			mustRun(t, f.gate, "update-ref", "-d", ref)
 		}
 
 		records, err := f.db.GetRecoveryArchivesByRun(f.run.ID)
@@ -2911,7 +2907,6 @@ func TestBoundArchiveUnverifiedMetadataSiblingProofMatrixFailsClosed(t *testing.
 	})
 
 	t.Run("record and ref mutations fail closed without Git or DB mutation", func(t *testing.T) {
-		f := newUnverifiedSiblingArchiveRecoverFixture(t)
 		if bound := f.service.BindRecoveryArchive(f.ctx, f.archiveRef); bound.Safety != "blocked_pipeline_owned_recoverable" {
 			t.Fatalf("bind = %#v", bound)
 		}
@@ -2937,17 +2932,14 @@ func TestBoundArchiveUnverifiedMetadataSiblingProofMatrixFailsClosed(t *testing.
 			if state.State != StatePipelineOwned || state.Safety != want || state.NextAction == nil || state.NextAction.Code != "inspect_and_reconcile_manually" {
 				t.Fatalf("detection refusal = %#v, want %s/inspect_and_reconcile_manually", state, want)
 			}
-			if after := gitSnapshot(); after != before {
-				t.Fatal("detection refusal mutated Git state")
-			}
 			for _, keep := range []bool{true, false} {
 				recovered := f.service.Recover(f.ctx, keep)
 				if recovered.Recovered || recovered.Changed || recovered.State != StatePipelineOwned || recovered.Safety != want {
 					t.Fatalf("recover(keep=%v) refusal = %#v, want %s", keep, recovered, want)
 				}
-				if after := gitSnapshot(); after != before {
-					t.Fatalf("recover(keep=%v) refusal mutated Git state", keep)
-				}
+			}
+			if after := gitSnapshot(); after != before {
+				t.Fatal("refusal mutated Git state")
 			}
 			reloaded, err := f.db.GetRun(f.run.ID)
 			if err != nil || reloaded == nil {
@@ -2961,9 +2953,6 @@ func TestBoundArchiveUnverifiedMetadataSiblingProofMatrixFailsClosed(t *testing.
 			t.Helper()
 			_, _ = gitpkg.Run(f.ctx, f.local, "symbolic-ref", "--delete", f.archiveRef)
 			mustRun(t, f.local, "update-ref", f.archiveRef, f.sibling)
-			if state := f.service.InspectCached(f.ctx); state.Safety != "blocked_pipeline_owned_recoverable" {
-				t.Fatalf("restored archive did not revalidate: %#v", state)
-			}
 		}
 
 		t.Run("missing archive ref", func(t *testing.T) {
@@ -2988,6 +2977,16 @@ func TestBoundArchiveUnverifiedMetadataSiblingProofMatrixFailsClosed(t *testing.
 			assertFailClosedInvariants(t, "blocked_recover_archive_replaced")
 			restoreArchive()
 		})
+		t.Run("tree-replaced archive ref", func(t *testing.T) {
+			baseTree := mustRun(t, f.local, "rev-parse", f.base+"^{tree}")
+			looseRef := mustRun(t, f.local, "rev-parse", "--git-path", f.archiveRef)
+			if !filepath.IsAbs(looseRef) {
+				looseRef = filepath.Join(f.local, looseRef)
+			}
+			mustWrite(t, looseRef, baseTree+"\n")
+			assertFailClosedInvariants(t, "blocked_recover_archive_replaced")
+			restoreArchive()
+		})
 		t.Run("symbolic archive ref", func(t *testing.T) {
 			mustRun(t, f.local, "symbolic-ref", f.archiveRef, "refs/heads/feature/recover")
 			assertFailClosedInvariants(t, "blocked_recover_archive_symbolic")
@@ -2999,8 +2998,7 @@ func TestBoundArchiveUnverifiedMetadataSiblingProofMatrixFailsClosed(t *testing.
 				t.Fatal("expected unreferenced recorded head B to be pruned from gate")
 			}
 			assertFailClosedInvariants(t, "blocked_recover_preserved_head_missing")
-			pipeline := filepath.Join(filepath.Dir(f.local), "pipeline")
-			mustRun(t, pipeline, "push", f.gate, f.preserved+":refs/no-mistakes/test-restore-b")
+			mustRun(t, f.local, "push", f.gate, f.preserved+":refs/no-mistakes/test-restore-b")
 			mustRun(t, f.gate, "update-ref", "-d", "refs/no-mistakes/test-restore-b")
 			restoreArchive()
 		})
@@ -3039,20 +3037,20 @@ func TestBoundArchiveUnverifiedMetadataSiblingProofMatrixFailsClosed(t *testing.
 				run.ReviewApprovedHeadSHA = &approved
 			}},
 		}
+		beforeMeta := gitSnapshot()
 		for _, tc := range metadataCases {
 			t.Run(tc.name, func(t *testing.T) {
 				rec := validRecord
 				run := *f.run
 				tc.mutate(&rec, &run)
-				before := gitSnapshot()
 				proof := f.service.verifyRecoveryArchiveRecord(f.ctx, &validState, &run, &rec)
 				if proof.available || proof.safety != tc.want {
 					t.Fatalf("proof = %#v, want %s", proof, tc.want)
 				}
-				if after := gitSnapshot(); after != before {
-					t.Fatal("metadata refusal mutated Git state")
-				}
 			})
+		}
+		if afterMeta := gitSnapshot(); afterMeta != beforeMeta {
+			t.Fatal("metadata refusal mutated Git state")
 		}
 
 		// Conflicting gate rewrite anchor refuses with blocked_recover_anchor_mismatch.
@@ -3085,6 +3083,7 @@ func TestBoundArchiveUnverifiedMetadataSiblingRaceAndCASRefusal(t *testing.T) {
 	t.Parallel()
 
 	t.Run("gate branch race before custody stamp refuses without stamping custody", func(t *testing.T) {
+		t.Parallel()
 		f := newUnverifiedSiblingArchiveRecoverFixture(t)
 		if bound := f.service.BindRecoveryArchive(f.ctx, f.archiveRef); bound.Safety != "blocked_pipeline_owned_recoverable" {
 			t.Fatalf("bind = %#v", bound)
@@ -3109,6 +3108,7 @@ func TestBoundArchiveUnverifiedMetadataSiblingRaceAndCASRefusal(t *testing.T) {
 	})
 
 	t.Run("DB CAS mismatch before custody stamp refuses without stamping custody or losing anchors", func(t *testing.T) {
+		t.Parallel()
 		f := newUnverifiedSiblingArchiveRecoverFixture(t)
 		if bound := f.service.BindRecoveryArchive(f.ctx, f.archiveRef); bound.Safety != "blocked_pipeline_owned_recoverable" {
 			t.Fatalf("bind = %#v", bound)

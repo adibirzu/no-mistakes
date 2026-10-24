@@ -177,6 +177,119 @@ func TestAxiRespond_WaitElapsedAfterSubmissionReattachesWithoutRespondingAgain(t
 	}
 }
 
+func TestAxiRespond_SlowPreflightDoesNotConsumeWaitBeforeSubmission(t *testing.T) {
+	var responded atomic.Bool
+	fx := newAxiTimeoutFixture(t, axiTimeoutOpts{responded: &responded})
+	fx.setGetRun(func(context.Context, int) (*ipc.RunInfo, error) {
+		return fx.awaiting(), nil
+	})
+
+	origHook := axiPreflightHook
+	axiPreflightHook = func(ctx context.Context) error {
+		return sleepOrDone(ctx, 350*time.Millisecond)
+	}
+	t.Cleanup(func() { axiPreflightHook = origHook })
+
+	started := time.Now()
+	out, err := executeCmd("axi", "respond", "--action", "approve", "--wait", "250ms")
+	elapsed := time.Since(started)
+	assertWaitElapsed(t, err, out, "250ms")
+	if !responded.Load() {
+		t.Fatal("response was not submitted before the wait elapsed despite slow preflight")
+	}
+	if !strings.Contains(out, "Re-run `no-mistakes axi run`") {
+		t.Fatalf("post-response timeout did not provide a non-mutating reattach command:\n%s", out)
+	}
+	if strings.Contains(out, "Re-run `no-mistakes axi respond") {
+		t.Fatalf("post-response timeout instructed the caller to submit another response:\n%s", out)
+	}
+	if elapsed < 500*time.Millisecond {
+		t.Fatalf("elapsed = %s, want at least 350ms preflight + 250ms wait", elapsed)
+	}
+	if elapsed > 4*time.Second {
+		t.Fatalf("elapsed = %s, want bounded return near 600ms", elapsed)
+	}
+}
+
+func TestAxiRespond_PreflightContextCancellationStopsWithoutSubmission(t *testing.T) {
+	var responded atomic.Bool
+	fx := newAxiTimeoutFixture(t, axiTimeoutOpts{responded: &responded})
+	fx.setGetRun(func(context.Context, int) (*ipc.RunInfo, error) {
+		return fx.awaiting(), nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	origHook := axiPreflightHook
+	axiPreflightHook = func(c context.Context) error {
+		cancel()
+		return c.Err()
+	}
+	t.Cleanup(func() { axiPreflightHook = origHook })
+
+	out, err := executeCmdWithContext(ctx, "axi", "respond", "--action", "approve", "--wait", "250ms")
+	if err == nil {
+		t.Fatalf("expected error from canceled context, got success:\n%s", out)
+	}
+	if responded.Load() {
+		t.Fatal("response was submitted despite preflight cancellation")
+	}
+	if strings.Contains(out, "wait of 250ms elapsed") {
+		t.Fatalf("preflight cancellation reported wait elapsed:\n%s", out)
+	}
+}
+
+func TestAxiRun_SlowPreflightDoesNotConsumeWaitBeforeActiveRunLookup(t *testing.T) {
+	fx := newAxiTimeoutFixture(t, axiTimeoutOpts{})
+	fx.setGetRun(func(context.Context, int) (*ipc.RunInfo, error) {
+		return fx.running(), nil
+	})
+
+	origHook := axiPreflightHook
+	axiPreflightHook = func(ctx context.Context) error {
+		return sleepOrDone(ctx, 350*time.Millisecond)
+	}
+	t.Cleanup(func() { axiPreflightHook = origHook })
+
+	started := time.Now()
+	out, err := executeCmd("axi", "run", "--wait", "250ms")
+	elapsed := time.Since(started)
+	assertWaitElapsed(t, err, out, "250ms")
+	if elapsed < 500*time.Millisecond {
+		t.Fatalf("elapsed = %s, want at least 350ms preflight + 250ms wait", elapsed)
+	}
+	if elapsed > 4*time.Second {
+		t.Fatalf("elapsed = %s, want bounded return near 600ms", elapsed)
+	}
+}
+
+func TestAxiRun_PreflightContextCancellationStopsBeforeDaemon(t *testing.T) {
+	var activeCalled atomic.Bool
+	fx := newAxiTimeoutFixture(t, axiTimeoutOpts{})
+	fx.setGetActive(func(context.Context) (*ipc.RunInfo, error) {
+		activeCalled.Store(true)
+		return fx.running(), nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	origHook := axiPreflightHook
+	axiPreflightHook = func(c context.Context) error {
+		cancel()
+		return c.Err()
+	}
+	t.Cleanup(func() { axiPreflightHook = origHook })
+
+	out, err := executeCmdWithContext(ctx, "axi", "run", "--wait", "250ms")
+	if err == nil {
+		t.Fatalf("expected error from canceled context, got success:\n%s", out)
+	}
+	if activeCalled.Load() {
+		t.Fatal("active run lookup occurred despite preflight cancellation")
+	}
+	if strings.Contains(out, "wait of 250ms elapsed") {
+		t.Fatalf("preflight cancellation reported wait elapsed:\n%s", out)
+	}
+}
+
 func TestAxiRun_WaitZeroIsUsageError(t *testing.T) {
 	out, err := executeCmd("axi", "run", "--wait", "0", "--intent", "x")
 	var ee *exitError
