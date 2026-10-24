@@ -53,3 +53,16 @@ func RecoveryLocalRef(runID string) string {
 func RecoveryGateRef(runID string) string {
 	return "refs/no-mistakes/recover-gate/" + runID
 }
+
+// RecoveryRewriteRef keeps a terminal run's metadata-rewritten sibling commit
+// reachable in the local gate alongside RecoveryRef when custody is returned
+// at the submitted head.
+func RecoveryRewriteRef(runID string) string {
+	return "refs/no-mistakes/recover-rewrite/" + runID
+}
+
+// PreserveRecoveryRewriteHead creates or verifies a run-specific metadata-rewrite
+// recovery anchor without ever replacing existing evidence.
+func PreserveRecoveryRewriteHead(ctx context.Context, dir, runID, head string) error {
+	return PreserveRecoveryAnchor(ctx, dir, RecoveryRewriteRef(runID), head)
+}

@@ -588,8 +588,15 @@ func buildNoMistakesBinary(t *testing.T) string {
 			name += ".exe"
 		}
 		builtBin = filepath.Join(dir, name)
+		repoRoot := repoRootFromThisFile()
 		cmd := exec.Command("go", "build", "-o", builtBin, "github.com/kunchenguid/no-mistakes/cmd/no-mistakes")
-		cmd.Dir = repoRootFromThisFile()
+		cmd.Dir = repoRoot
+		if gitDirOut, err := exec.Command("git", "-C", repoRoot, "rev-parse", "--path-format=absolute", "--git-dir").Output(); err == nil {
+			cmd.Env = append(os.Environ(),
+				"GIT_DIR="+strings.TrimSpace(string(gitDirOut)),
+				"GIT_WORK_TREE="+repoRoot,
+			)
+		}
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			builtBinErr = errors.New(string(out) + ": " + err.Error())

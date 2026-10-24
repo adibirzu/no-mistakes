@@ -542,6 +542,49 @@ func (d *DB) SetRunCustodyReturned(id string) error {
 	return d.SetRunsCustodyReturned([]string{id})
 }
 
+// SetRunCustodyReturnedUnverifiedCAS stamps custody_returned_at only when the
+// run still matches the exact unverified, unapproved, unpublished terminal
+// state proven before anchoring. It never modifies head_sha, submitted_head_sha,
+// status, review_approved_head_sha, or terminal_head_verified_at, and fails
+// closed if any field changed.
+func (d *DB) SetRunCustodyReturnedUnverifiedCAS(id string, status types.RunStatus, headSHA, submittedHeadSHA string) error {
+	if !status.Terminal() {
+		return fmt.Errorf("set unverified run custody returned: status %q is not terminal", status)
+	}
+	id = strings.TrimSpace(id)
+	headSHA = strings.TrimSpace(headSHA)
+	submittedHeadSHA = strings.TrimSpace(submittedHeadSHA)
+	if id == "" || headSHA == "" || submittedHeadSHA == "" || headSHA == submittedHeadSHA {
+		return fmt.Errorf("set unverified run custody returned: invalid head binding")
+	}
+	ts := now()
+	res, err := d.sql.Exec(
+		`UPDATE runs
+		 SET custody_returned_at = ?, updated_at = ?
+		 WHERE id = ?
+		   AND status = ?
+		   AND head_sha = ?
+		   AND submitted_head_sha = ?
+		   AND last_pushed_sha IS NULL
+		   AND COALESCE(push_active, 0) = 0
+		   AND review_approved_head_sha IS NULL
+		   AND terminal_head_verified_at IS NULL
+		   AND custody_returned_at IS NULL`,
+		ts, ts, id, status, headSHA, submittedHeadSHA,
+	)
+	if err != nil {
+		return fmt.Errorf("set unverified run custody returned: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("set unverified run custody returned: rows affected: %w", err)
+	}
+	if affected != 1 {
+		return fmt.Errorf("set unverified run custody returned: run %s state changed before custody stamp", id)
+	}
+	return nil
+}
+
 func (d *DB) SetRunsCustodyReturned(ids []string) error {
 	if len(ids) == 0 {
 		return nil
