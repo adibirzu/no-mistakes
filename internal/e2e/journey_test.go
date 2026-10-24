@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -1693,8 +1694,14 @@ func assertExplicitAttachUsesRepoWideActiveRun(t *testing.T, h *Harness) {
 	if strings.Contains(out, "No active run") {
 		t.Fatalf("explicit attach should use repo-wide active run instead of current branch fallback, got:\n%s", out)
 	}
-	if !strings.Contains(out, "could not open a new TTY") {
-		t.Fatalf("explicit attach output missing expected TUI setup failure %q (elapsed: %s, err: %v):\n%s", "could not open a new TTY", attachElapsed, err, out)
+	if runtime.GOOS == "windows" {
+		if !strings.Contains(out, "error opening file") || !strings.Contains(out, "CONIN$") {
+			t.Fatalf("explicit attach output missing expected Windows TUI setup failure (elapsed: %s, err: %v):\n%s", attachElapsed, err, out)
+		}
+	} else {
+		if !strings.Contains(out, "could not open a new TTY") {
+			t.Fatalf("explicit attach output missing expected Unix TUI setup failure %q (elapsed: %s, err: %v):\n%s", "could not open a new TTY", attachElapsed, err, out)
+		}
 	}
 	if activeAfter == nil || activeAfter.ID != run.ID {
 		t.Fatalf("run %s finished or failed during attach instead of remaining active (elapsed: %s, activeAfter: %+v)", run.ID, attachElapsed, activeAfter)
