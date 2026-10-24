@@ -1601,17 +1601,38 @@ func TestAxiUnverifiedMetadataSiblingArchiveRecoveryPreservesBothHeadsAndStampsC
 	if err != nil {
 		t.Fatalf("bind archive ref: %v\n%s", err, boundOut)
 	}
-	for _, want := range []string{
-		"state: pipeline_owned",
-		"safety: blocked_pipeline_owned_recoverable",
-		"required_head: " + submitted,
-		"preserved_head: " + siblingBPrime,
-		"archive_ref: " + archiveRef,
-		"command: no-mistakes axi sync --recover --keep-local",
-	} {
-		if !strings.Contains(boundOut, want) {
-			t.Fatalf("bind output missing %q:\n%s", want, boundOut)
-		}
+	var boundDoc struct {
+		BranchSync struct {
+			State    string `toon:"state"`
+			Safety   string `toon:"safety"`
+			Recovery struct {
+				Source        string `toon:"source"`
+				RequiredHead  string `toon:"required_head"`
+				PreservedHead string `toon:"preserved_head"`
+				ArchiveRef    string `toon:"archive_ref"`
+				KeepLocal     bool   `toon:"keep_local"`
+				Proof         string `toon:"proof"`
+			} `toon:"recovery"`
+			NextAction struct {
+				Code    string `toon:"code"`
+				Command string `toon:"command"`
+			} `toon:"next_action"`
+		} `toon:"branch_sync"`
+	}
+	if err := toon.UnmarshalString(boundOut, &boundDoc); err != nil {
+		t.Fatalf("decode bind output: %v\n%s", err, boundOut)
+	}
+	if boundDoc.BranchSync.State != "pipeline_owned" ||
+		boundDoc.BranchSync.Safety != "blocked_pipeline_owned_recoverable" ||
+		boundDoc.BranchSync.Recovery.Source != "bound_archive" ||
+		boundDoc.BranchSync.Recovery.RequiredHead != submitted ||
+		boundDoc.BranchSync.Recovery.PreservedHead != siblingBPrime ||
+		boundDoc.BranchSync.Recovery.ArchiveRef != archiveRef ||
+		!boundDoc.BranchSync.Recovery.KeepLocal ||
+		boundDoc.BranchSync.Recovery.Proof != "verified" ||
+		boundDoc.BranchSync.NextAction.Code != "recover_custody" ||
+		boundDoc.BranchSync.NextAction.Command != "no-mistakes axi sync --recover --keep-local" {
+		t.Fatalf("unexpected bound document: %#v\n%s", boundDoc, boundOut)
 	}
 
 	refused, err := executeCmd("axi", "sync", "--recover")

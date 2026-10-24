@@ -106,6 +106,7 @@ func newRecoverFixture(t *testing.T, status types.RunStatus) *recoverFixture {
 	// onto the gate branch; nothing is ever pushed to the upstream.
 	gate := filepath.Join(root, "gate.git")
 	mustRun(t, root, "init", "--bare", gate)
+	configureIdentity(t, gate)
 	mustRun(t, local, "push", gate, "refs/heads/feature/recover:refs/heads/feature/recover")
 	pipeline := filepath.Join(root, "pipeline")
 	mustRun(t, root, "-c", "core.autocrlf=false", "clone", gate, pipeline)
@@ -1027,6 +1028,7 @@ func newUnmovedRecoverFixture(t *testing.T, status types.RunStatus) *recoverFixt
 	// the pipeline committed anything: preserved head == submitted head.
 	gate := filepath.Join(root, "gate.git")
 	mustRun(t, root, "init", "--bare", gate)
+	configureIdentity(t, gate)
 	mustRun(t, local, "push", gate, "refs/heads/feature/recover:refs/heads/feature/recover")
 
 	database, err := db.Open(filepath.Join(root, "state.sqlite"))
@@ -2623,6 +2625,7 @@ func newUnverifiedSiblingArchiveRecoverFixture(t *testing.T) *unverifiedSiblingF
 
 	gate := filepath.Join(root, "gate.git")
 	mustRun(t, root, "init", "--bare", gate)
+	configureIdentity(t, gate)
 	mustRun(t, local, "push", gate, "refs/heads/feature/recover:refs/heads/feature/recover")
 
 	pipeline := filepath.Join(root, "pipeline")
@@ -2865,7 +2868,7 @@ func TestBoundArchiveUnverifiedMetadataSiblingProofMatrixFailsClosed(t *testing.
 
 		// Identical tree to B, but different parent (base instead of submitted A).
 		recordedTree := mustRun(t, f.gate, "rev-parse", f.preserved+"^{tree}")
-		diffParentSHA := mustRun(t, f.gate, "commit-tree", recordedTree, "-p", f.base, "-m", "same tree wrong parent")
+		diffParentSHA := mustRun(t, f.gate, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit-tree", recordedTree, "-p", f.base, "-m", "same tree wrong parent")
 		diffParentRef := "refs/heads/archive/diff-parent"
 		mustRun(t, f.gate, "update-ref", diffParentRef, diffParentSHA)
 		mustRun(t, f.local, "fetch", "--no-tags", f.gate, diffParentRef+":"+diffParentRef)
@@ -2876,8 +2879,8 @@ func TestBoundArchiveUnverifiedMetadataSiblingProofMatrixFailsClosed(t *testing.
 		}
 
 		// Identical tree to B, but swapped ordered parents [base, submitted] vs [submitted, base].
-		mergeB := mustRun(t, f.gate, "commit-tree", recordedTree, "-p", f.submitted, "-p", f.base, "-m", "merge B")
-		mergeSwapped := mustRun(t, f.gate, "commit-tree", recordedTree, "-p", f.base, "-p", f.submitted, "-m", "merge B swapped")
+		mergeB := mustRun(t, f.gate, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit-tree", recordedTree, "-p", f.submitted, "-p", f.base, "-m", "merge B")
+		mergeSwapped := mustRun(t, f.gate, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit-tree", recordedTree, "-p", f.base, "-p", f.submitted, "-m", "merge B swapped")
 		swappedRef := "refs/heads/archive/swapped-parents"
 		mustRun(t, f.gate, "update-ref", swappedRef, mergeSwapped)
 		mustRun(t, f.local, "fetch", "--no-tags", f.gate, swappedRef+":"+swappedRef)
