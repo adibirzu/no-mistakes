@@ -1676,7 +1676,7 @@ func assertExplicitAttachUsesRepoWideActiveRun(t *testing.T, h *Harness) {
 		t.Fatalf("expected no active run for current branch main, got %+v", currentBranchMatch)
 	}
 
-	out, err := h.Run("attach")
+	out, err := h.RunDetachedTTY("attach")
 	if err == nil {
 		t.Fatalf("non-TTY attach should exit after TUI setup failure, got nil error and output:\n%s", out)
 	}

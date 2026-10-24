@@ -307,6 +307,29 @@ func (h *Harness) RunInDirWithEnv(dir string, env map[string]string, args ...str
 	return string(out), err
 }
 
+// RunDetachedTTY invokes the no-mistakes binary detached from any controlling
+// terminal so interactive TUI commands fail immediately when non-TTY behavior
+// is under test.
+func (h *Harness) RunDetachedTTY(args ...string) (string, error) {
+	h.t.Helper()
+	return h.RunInDirDetachedTTY(h.WorkDir, args...)
+}
+
+// RunInDirDetachedTTY invokes the no-mistakes binary in dir detached from any
+// controlling terminal.
+func (h *Harness) RunInDirDetachedTTY(dir string, args ...string) (string, error) {
+	h.t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, h.NMBin, args...)
+	cmd.Dir = dir
+	cmd.Env = mergedEnv(os.Environ(), nil)
+	detachControllingTTY(cmd)
+	out, err := cmd.CombinedOutput()
+	h.syncDaemonOwnership()
+	return string(out), err
+}
+
 // syncDaemonOwnership records a live daemon PID into the suite inventory when
 // a harness command has (possibly) started or restarted the detached daemon.
 func (h *Harness) syncDaemonOwnership() {
