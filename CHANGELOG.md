@@ -1,5 +1,24 @@
 # Changelog
 
+## [1.70.0](https://github.com/adibirzu/no-mistakes/compare/v1.69.0...v1.70.0) (2026-10-24)
+
+
+### Features
+
+* **axi:** bind runs to explicit existing PRs ([b710ae5](https://github.com/adibirzu/no-mistakes/commit/b710ae5fef844fbf5b357ea82b43b68a7fbd1f7a))
+* **pipeline:** prepare dependencies once per run ([#937](https://github.com/adibirzu/no-mistakes/issues/937)) ([4603016](https://github.com/adibirzu/no-mistakes/commit/4603016d04f78f360235704d73b01e2a6eaf6cac))
+
+
+### Bug Fixes
+
+* **branchsync:** allow bound archive keep-local recovery for unverified metadata sibling ([bb7f22a](https://github.com/adibirzu/no-mistakes/commit/bb7f22ad37e80b9de7e4716ee7a075bb6a906546))
+* **branchsync:** cover sibling archive refusals and e2e provenance ([19e8589](https://github.com/adibirzu/no-mistakes/commit/19e858909f80c24d210714984ba09047e12c453f))
+* **branchsync:** recover custody for unverified metadata-sibling archives ([d59a8b4](https://github.com/adibirzu/no-mistakes/commit/d59a8b46713f1791ee986fd79afa50164412bf20))
+* **cli,branchsync:** bound wait after preflight and optimize unverified sibling proof ([a6fad7d](https://github.com/adibirzu/no-mistakes/commit/a6fad7d7a0f18d36b5bc6735eaa908e795529485))
+* **cli:** show elapsed time for the active review round ([#1001](https://github.com/adibirzu/no-mistakes/issues/1001)) ([2b98e45](https://github.com/adibirzu/no-mistakes/commit/2b98e458251207404b413ec65cbf205a1cb7ff57))
+* **pipeline:** bind runs to existing pull requests ([700be89](https://github.com/adibirzu/no-mistakes/commit/700be8966d290fa49e6bedba1732e173bc466aa3))
+* **push:** bootstrap attestation for bound PRs ([c023655](https://github.com/adibirzu/no-mistakes/commit/c0236558a9c054ad4b55eab340c849bbea6a3244))
+
 ## [1.69.0](https://github.com/kunchenguid/no-mistakes/compare/v1.68.0...v1.69.0) (2026-09-07)
 
 
