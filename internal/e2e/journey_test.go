@@ -1676,12 +1676,25 @@ func assertExplicitAttachUsesRepoWideActiveRun(t *testing.T, h *Harness) {
 		t.Fatalf("expected no active run for current branch main, got %+v", currentBranchMatch)
 	}
 
+	attachStart := time.Now()
 	out, err := h.RunDetachedTTY("attach")
+	attachElapsed := time.Since(attachStart)
+
+	activeAfter := h.ActiveRun("")
+	t.Logf("explicit attach non-TTY attempt elapsed=%s err=%v out=%q activeBefore=%s activeAfter=%+v",
+		attachElapsed, err, out, run.ID, activeAfter)
+
 	if err == nil {
 		t.Fatalf("non-TTY attach should exit after TUI setup failure, got nil error and output:\n%s", out)
 	}
+	if strings.Contains(err.Error(), "signal: killed") || strings.Contains(err.Error(), "deadline exceeded") {
+		t.Fatalf("non-TTY attach timed out or was killed rather than failing TUI setup promptly (elapsed: %s): %v\n%s", attachElapsed, err, out)
+	}
 	if strings.Contains(out, "No active run") {
 		t.Fatalf("explicit attach should use repo-wide active run instead of current branch fallback, got:\n%s", out)
+	}
+	if activeAfter == nil || activeAfter.ID != run.ID {
+		t.Fatalf("run %s finished or failed during attach instead of remaining active (elapsed: %s, activeAfter: %+v)", run.ID, attachElapsed, activeAfter)
 	}
 
 	h.CancelRun(run.ID)

@@ -319,7 +319,7 @@ func (h *Harness) RunDetachedTTY(args ...string) (string, error) {
 // controlling terminal.
 func (h *Harness) RunInDirDetachedTTY(dir string, args ...string) (string, error) {
 	h.t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, h.NMBin, args...)
 	cmd.Dir = dir

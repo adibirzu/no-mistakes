@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -103,12 +104,14 @@ func goListPackages(t *testing.T, patterns ...string) []string {
 			"GIT_WORK_TREE="+topLevel,
 		)
 	}
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("go list %s: %v\n%s", strings.Join(patterns, " "), err, string(out))
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("go list %s: %v\n%s", strings.Join(patterns, " "), err, stderr.String())
 	}
 	var packages []string
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+	for _, line := range strings.Split(strings.TrimSpace(stdout.String()), "\n") {
 		line = strings.TrimSpace(line)
 		if line != "" {
 			packages = append(packages, line)
